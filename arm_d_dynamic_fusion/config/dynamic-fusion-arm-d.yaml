@@ -1,0 +1,51 @@
+# dynamic-fusion-arm-d.yaml
+#
+# History-representation config for Arm D (cross_modal_gated_fusion_proposal.md).
+# Loaded via arm_d_pi0.ArmDConfig(history_config="dynamic-fusion-arm-d.yaml", ...)
+# through mme_vla_suite.models.config.utils.get_history_config, same loader every
+# other MME-VLA variant config uses.
+#
+# `budget` below is the PERCEPTUAL stream's budget (M_perc, 512 tokens) -- it feeds
+# PerceptualMemory exactly as it does in the released perceptual-framesamp-modul.yaml
+# this file otherwise mirrors. The SYMBOLIC stream's budget (~64 tokens, M_sym) is
+# not a field in this file: it's ArmDConfig.max_token_len (a top-level Python config
+# field, defaulted to 64 by the base HistoryPi0Config already), since that's what
+# sizes the tokenized-subgoal-history input, not the memory-representation yaml.
+
+budget: 512
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+
+pool_type: mean
+
+use_pos_emb: true
+use_state_emb: false
+
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048 # SigLIP feature dim, matches every other released config
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+
+# Arm D's fusion mechanism: proposal section 3.3 / arm_d_dynamic_fusion.models.
+# history_gemma_dual.DualMemoryHistoryBlock only activates its dynamic_fusion
+# branch when integration_type == "dynamic_fusion".
+integration_type: dynamic_fusion
+memory_token_dim: 1024 # width both streams are projected to before the modulator
+
+# Not read by the released HistoryPi0 (which asserts representation_type in
+# {"perceptual","recurrent","symbolic"}) -- only arm_d_pi0.ArmDModel recognizes
+# this value, which is why Arm D subclasses rather than edits that assertion.
+representation_type: dual_symbolic_perceptual
+
+perceptual_memory:
+  type: frame_sampling # matches the released FrameSamp+Modul reference arm (Arm A)
+
+symbolic_memory:
+  type: simple_subgoal # simple (ungrounded) subgoals; see proposal section 4.2 for the planned corrupted-subgoal training variants (not part of this architecture-only pass)

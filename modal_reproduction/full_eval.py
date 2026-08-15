@@ -284,7 +284,7 @@ def _load_existing_results() -> dict:
     return existing
 
 
-@app.function(image=sim_image, volumes={RESULTS_VOLUME_PATH: results_volume}, timeout=60)
+@app.function(image=sim_image, volumes={RESULTS_VOLUME_PATH: results_volume}, timeout=600)
 def list_progress() -> dict:
     """Returns the full set of completed (seed, task, episode) results,
     keyed by the (seed, task_id, episode_idx) tuple itself - Modal's RPC
@@ -292,7 +292,7 @@ def list_progress() -> dict:
     return _load_existing_results()
 
 
-@app.function(image=sim_image, volumes={RESULTS_VOLUME_PATH: results_volume}, timeout=60)
+@app.function(image=sim_image, volumes={RESULTS_VOLUME_PATH: results_volume}, timeout=600)
 def list_progress_with_timestamps() -> list:
     """
     What it does:
@@ -397,7 +397,21 @@ def run_batch_remote(max_new_episodes: int = 300) -> dict:
         by_seed[job[0]].append(job)
 
     def _run_seed_group(jobs: list) -> list:
-        return [run_one_episode.remote(*job) for job in jobs]
+        # A single episode's exception used to propagate all the way up and
+        # kill the whole batch (all seed-lanes), stopping well short of the
+        # requested count - confirmed 2026-07-28 (an AssertionError inside
+        # one episode's infer() call took down a 158-episode batch after
+        # only 75 completed). Catching per-episode means one bad episode
+        # just gets skipped (left pending for automatic retry next run,
+        # since no result file gets written for it) while the rest of this
+        # seed's episodes - and the other seeds entirely - keep going.
+        group_results = []  # list[dict]
+        for job in jobs:
+            try:
+                group_results.append(run_one_episode.remote(*job))
+            except Exception as e:  # noqa: BLE001
+                print(f"[full_eval] episode {job} raised {type(e).__name__}: {e} - skipping, left pending for retry")
+        return group_results
 
     results = []  # list[dict]
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(by_seed)) as executor:
