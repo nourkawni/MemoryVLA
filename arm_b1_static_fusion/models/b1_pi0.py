@@ -1,27 +1,28 @@
 """
-arm_d_pi0.py
+b1_pi0.py
 
-Wires Arm D's dual-stream memory encoders (symbolic_mem_encoder,
-history_gemma_dual) into a runnable pi0.5 policy model, by subclassing
+Wires Arm B1's dual-stream memory encoders (symbolic_mem_encoder,
+history_gemma_static) into a runnable pi0.5 policy model, by subclassing
 mme_vla_suite's HistoryPi0Config/HistoryPi0 rather than editing them --
-robomme_policy_learning/ stays untouched.
+robomme_policy_learning/ stays untouched. Structurally a near-exact copy of
+arm_d_dynamic_fusion.models.arm_d_pi0 (ArmDConfig/ArmDModel): B1 and D share
+the same observation shapes, the same two encoders, and the same "both
+streams enter only at the action-expert modulator" wiring -- the ONLY
+substantive difference is that ArmDModel builds a DualMemoryModule (learned
+router) where B1Model builds a StaticMemoryModule (fixed 50/50 gate).
 
 Role in the system: this is the one file a training or eval script actually
-imports. ArmDConfig.create() builds an ArmDModel from a history_config yaml
-(config/dynamic-fusion-arm-d.yaml); ArmDModel.compute_loss/sample_actions run
+imports. B1Config.create() builds a B1Model from a history_config yaml
+(config/static-fusion-arm-b1.yaml); B1Model.compute_loss/sample_actions run
 the same flow-matching objective as every other MME-VLA variant, but route
-memory through DualMemoryModule (two streams + JointGatedModulator) instead
-of history_gemma.Module (one stream).
+memory through StaticMemoryModule (two streams + StaticGatedModulator)
+instead of history_gemma.Module (one stream) or history_gemma_dual.
+DualMemoryModule (two streams + learned router).
 
-__init__/embed_memory/compute_loss/sample_actions are overridden wholesale
-rather than editing HistoryPi0 with a fourth representation_type branch,
-because those methods are single monolithic blocks in the base class -- a
-subclass with focused overrides is the isolated, additive change here.
-embed_prefix/embed_suffix are inherited unchanged: Arm D's symbolic stream
-never enters the VLM prefix (representation_type is "dual_symbolic_
-perceptual", not "symbolic", so HistoryPi0.embed_prefix's symbolic-token
-branch never fires) and never needs the "context" integration path either --
-both memory streams reach the model only through the action-expert modulator.
+embed_prefix/embed_suffix are inherited unchanged from HistoryPi0, same
+rationale as Arm D: B1's symbolic stream never enters the VLM prefix and
+never needs the "context" integration path -- both memory streams reach the
+model only through the action-expert modulator.
 """
 
 import dataclasses
@@ -49,75 +50,69 @@ from mme_vla_suite.models.integration.history_observation import preprocess_obse
 from mme_vla_suite.models.config.utils import get_history_config
 from mme_vla_suite.models.representation.percep_mem import PerceptualMemory
 
-from arm_d_dynamic_fusion.models import history_gemma_dual as _dual_gemma
-from arm_d_dynamic_fusion.models.symbolic_mem_encoder import SymbolicMemoryEncoder
+from arm_b1_static_fusion.models import history_gemma_static as _static_gemma
+from arm_b1_static_fusion.models.symbolic_mem_encoder import SymbolicMemoryEncoder
 
 
-REPRESENTATION_TYPE = "dual_symbolic_perceptual"  # str, this arm's history_config.representation_type
-INTEGRATION_TYPE = "dynamic_fusion"  # str, this arm's history_config.integration_type
+REPRESENTATION_TYPE = "dual_symbolic_perceptual"  # str, same value Arm D uses -- both streams admitted at the modulator
+INTEGRATION_TYPE = "static_fusion"  # str, this arm's history_config.integration_type
 
 
 @dataclasses.dataclass(frozen=True)
-class ArmDConfig(HistoryPi0Config):
+class B1Config(HistoryPi0Config):
     """
     What it does:
-        Config for Arm D. Same fields as HistoryPi0Config (use_history,
+        Config for Arm B1. Same fields as HistoryPi0Config (use_history,
         history_config, max_token_len, memory_expert_variant); overridden
-        only to build an ArmDModel and to advertise the observation shapes
-        for both memory streams at once (HistoryPi0Config.inputs_spec raises
-        on an unrecognized representation_type, since the released code only
-        ever builds one stream at a time).
+        only to build a B1Model and to advertise the observation shapes for
+        both memory streams at once, same as ArmDConfig does.
 
     Returns:
         n/a -- see create()/inputs_spec() below.
 
     Example input:
-        ArmDConfig(use_history=True, history_config="dynamic-fusion-arm-d.yaml")
+        B1Config(use_history=True, history_config="static-fusion-arm-b1.yaml")
 
     Example output:
-        an ArmDConfig instance.
+        a B1Config instance.
     """
 
     @override
-    def create(self, rng: at.KeyArrayLike) -> "ArmDModel":
+    def create(self, rng: at.KeyArrayLike) -> "B1Model":
         """
         What it does:
             Loads the history_config yaml (if given as a path/name) and
-            builds an ArmDModel from it. Mirrors HistoryPi0Config.create()
-            exactly, except it returns an ArmDModel instead of a HistoryPi0,
-            and skips that method's max_token_len *= 2 doubling -- that
-            doubling was sized for the released "symbolic memory concatenated
-            into the VLM prompt" path; Arm D's symbolic budget (~64 tokens,
-            proposal section 3.2) is max_token_len directly, unmodified.
+            builds a B1Model from it. Mirrors ArmDConfig.create() exactly,
+            except it returns a B1Model instead of an ArmDModel.
 
         Returns:
-            ArmDModel -- an initialized flax.nnx model.
+            B1Model -- an initialized flax.nnx model.
 
         Example input:
-            ArmDConfig(use_history=True,
-                       history_config="dynamic-fusion-arm-d.yaml").create(jax.random.key(0))
+            B1Config(use_history=True,
+                     history_config="static-fusion-arm-b1.yaml").create(jax.random.key(0))
 
         Example output:
-            <ArmDModel ...>
+            <B1Model ...>
         """
         if self.history_config is not None:
             loaded_config = get_history_config(self.history_config)  # omegaconf.DictConfig
             config_with_loaded_history = dataclasses.replace(
                 self, history_config=loaded_config
-            )  # ArmDConfig
-            return ArmDModel(config_with_loaded_history, rngs=nnx.Rngs(rng))
-        return ArmDModel(self, rngs=nnx.Rngs(rng))
+            )  # B1Config
+            return B1Model(config_with_loaded_history, rngs=nnx.Rngs(rng))
+        return B1Model(self, rngs=nnx.Rngs(rng))
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[HistAugObservation, Actions]:
         """
         What it does:
-            Declares the shapes/dtypes of a dummy batch for Arm D: the base
+            Declares the shapes/dtypes of a dummy batch for B1: the base
             pi0.5 observation (images, state, instruction language) plus
-            BOTH memory streams at once -- symbolic_tokenized_prompt(_mask)
-            for M_sym's input and static_image_emb/pos_emb/state_emb/mask for
-            M_perc's input (the same fields the released perceptual-only
-            variants use).
+            BOTH memory streams at once -- identical field set to Arm D's
+            inputs_spec, since B1 and D share the same observation interface
+            and differ only in how the two streams are combined once inside
+            the modulator.
 
         Returns:
             tuple[HistAugObservation, Actions] -- shape/dtype specs (via
@@ -178,70 +173,68 @@ class ArmDConfig(HistoryPi0Config):
         What it does:
             HistoryPi0Config.get_freeze_filter() exempts trainable memory
             modules from the frozen-VLM-backbone filter by matching `.*mem.*`
-            in the "/"-joined nnx state path (see nnx_utils.PathRegex). That
-            regex does not match `joint_gated_modulator`, the module name
-            JointGatedModulator is instantiated under in
-            history_gemma_dual.DualMemoryHistoryBlock -- the one new
-            mechanism this arm exists to train. Left unfixed, the base
-            filter would freeze it (it sits inside the `.*llm.*`-matching
-            scanned stack and isn't excluded), training everything else
-            while the gate itself never moves off its zero-init identity
-            state. This override additionally exempts it, on top of every-
-            thing the base filter already exempts (mem_attn_perc,
-            symbolic_mem_encoder, perceptual_mem_encoder, LoRA adapters).
+            in the "/"-joined nnx state path. That regex does not match
+            `static_gated_modulator`, the module name StaticGatedModulator is
+            instantiated under in history_gemma_static.StaticMemoryHistoryBlock
+            -- same gap Arm D hit with `joint_gated_modulator`. Even though
+            B1's gate itself has no learnable parameters, mlp_sym/mlp_perc
+            (the per-stream scale/shift proposals StaticGatedModulator still
+            learns) live inside that same module name, so leaving it
+            unfixed would freeze them too, at zero learning rate, while
+            everything around them moved.
 
         Returns:
             nnx.filterlib.Filter -- True for params that should stay frozen.
 
         Example input:
-            ArmDConfig(...).get_freeze_filter()
+            B1Config(...).get_freeze_filter()
 
         Example output:
             An nnx.All(...) filter object (not human-readable; used only as
             an argument to nnx.state(...).filter(...) during training setup).
         """
         base_frozen = super().get_freeze_filter()  # nnx.filterlib.Filter
-        gate_exempt = nnx_utils.PathRegex(r".*joint_gated_modulator.*")  # nnx.filterlib.Filter
+        gate_exempt = nnx_utils.PathRegex(r".*static_gated_modulator.*")  # nnx.filterlib.Filter
         return nnx.All(base_frozen, nnx.Not(gate_exempt))
 
 
-class ArmDModel(HistoryPi0):
+class B1Model(HistoryPi0):
     """
     What it does:
-        Arm D's policy model. Builds a perceptual memory encoder (unchanged,
+        Arm B1's policy model. Builds a perceptual memory encoder (unchanged,
         reused from the released PerceptualMemory), a symbolic memory encoder
         (new, symbolic_mem_encoder.SymbolicMemoryEncoder), and a
-        DualMemoryModule action-expert stack whose action-expert layers each
-        run JointGatedModulator on both streams.
+        StaticMemoryModule action-expert stack whose action-expert layers
+        each run StaticGatedModulator's fixed 50/50 combine on both streams.
 
     Returns:
         n/a -- see __init__/compute_loss/sample_actions below.
 
     Example input:
-        ArmDModel(config, rngs=nnx.Rngs(0))
+        B1Model(config, rngs=nnx.Rngs(0))
 
     Example output:
-        an ArmDModel instance (a flax.nnx.Module).
+        a B1Model instance (a flax.nnx.Module).
     """
 
-    def __init__(self, config: ArmDConfig, rngs: nnx.Rngs):
+    def __init__(self, config: B1Config, rngs: nnx.Rngs):
         BaseModel.__init__(self, config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05  # bool
         paligemma_config = _gemma.get_config(config.paligemma_variant)  # Config, VLM expert (width 2048)
         action_expert_config = _gemma.get_config(config.action_expert_variant)  # Config, action expert (width 1024)
 
         self.config = config
-        self.use_history = config.use_history  # bool, must be True for Arm D
-        assert self.use_history, "ArmDModel requires use_history=True with a dual_symbolic_perceptual history_config."
+        self.use_history = config.use_history  # bool, must be True for B1
+        assert self.use_history, "B1Model requires use_history=True with a dual_symbolic_perceptual history_config."
 
         self.history_config = config.history_config
-        self.integration_type = config.history_config.integration_type  # str, "dynamic_fusion"
+        self.integration_type = config.history_config.integration_type  # str, "static_fusion"
         self.representation_type = config.history_config.representation_type  # str, "dual_symbolic_perceptual"
         assert self.integration_type == INTEGRATION_TYPE, (
-            f"ArmDModel expects integration_type={INTEGRATION_TYPE!r}, got {self.integration_type!r}."
+            f"B1Model expects integration_type={INTEGRATION_TYPE!r}, got {self.integration_type!r}."
         )
         assert self.representation_type == REPRESENTATION_TYPE, (
-            f"ArmDModel expects representation_type={REPRESENTATION_TYPE!r}, got {self.representation_type!r}."
+            f"B1Model expects representation_type={REPRESENTATION_TYPE!r}, got {self.representation_type!r}."
         )
 
         self.perceptual_mem_encoder = PerceptualMemory(
@@ -255,12 +248,12 @@ class ArmDModel(HistoryPi0):
         )  # builds M_sym: PaliGemma subgoal-token embeddings -> width 1024
 
         print(
-            "====== Arm D: dynamic cross-modal gated fusion "
+            "====== Arm B1: static (fixed 50/50) cross-modal fusion "
             f"(representation={self.representation_type}, integration={self.integration_type}) ======"
         )
 
         llm = nnx_bridge.ToNNX(
-            _dual_gemma.DualMemoryModule(
+            _static_gemma.StaticMemoryModule(
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
@@ -308,15 +301,12 @@ class ArmDModel(HistoryPi0):
             Builds both memory streams for one batch: M_perc via the
             unchanged PerceptualMemory encoder, M_sym via PaliGemma's
             embedder (width 2048) followed by SymbolicMemoryEncoder's
-            projection to width 1024.
+            projection to width 1024. Identical to ArmDModel.embed_memory.
 
         Returns:
             tuple[jax.Array, jax.Array, jax.Array, jax.Array] --
             (mem_sym_tokens [b, l_sym, 1024], mem_sym_mask [b, l_sym],
              mem_perc_tokens [b, l_perc, 1024], mem_perc_mask [b, l_perc]).
-            Unlike the base HistoryPi0.embed_memory, there is no fifth
-            "stats" element -- this is a fixed 4-tuple consumed only by this
-            class's own compute_loss/sample_actions below.
 
         Example input:
             self.embed_memory(observation)
@@ -352,30 +342,20 @@ class ArmDModel(HistoryPi0):
             One flow-matching training step: noises the action chunk, runs
             the dual-memory action expert to predict the denoising velocity,
             and returns the per-timestep squared error -- identical training
-            objective to every other MME-VLA variant (HistoryPi0.compute_loss),
-            routed through DualMemoryModule instead of history_gemma.Module.
+            objective to every other MME-VLA variant, routed through
+            StaticMemoryModule instead of DualMemoryModule or
+            history_gemma.Module.
 
-            Returns a (loss, stats) 2-tuple, not a bare array: scripts/train.py's
-            train_step unconditionally does `chunked_loss, stats =
-            model.compute_loss(...)` (see loss_fn inside train_step), and every
-            branch of the base HistoryPi0.compute_loss this overrides ends in
-            `return jnp.mean(...), stats` -- including the "modulation"
-            integration branch (Arm A's own code path), where stats is already
-            always None since PerceptualMemory's __call__ returns its third
-            element as None. stats=None here matches that exactly: it's a valid
-            aux value under nnx.value_and_grad(..., has_aux=True), and
-            train.py's only later use of it (`if config...representation_type
-            == "recurrent" and history_config.recurrent_memory.output_stats`,
-            around line 428) short-circuits before ever touching it, since
-            Arm D's representation_type is "dual_symbolic_perceptual", not
-            "recurrent". A bare array here (this override's original form)
-            makes that unpack fail immediately -- the smoke test didn't catch
-            it because it calls compute_loss directly with a single-variable
-            assignment, which doesn't require a 2-tuple return.
+            Returns a (loss, stats) 2-tuple, not a bare array, for the same
+            reason ArmDModel.compute_loss does (see that class's docstring):
+            scripts/train.py's train_step unconditionally unpacks
+            `chunked_loss, stats = model.compute_loss(...)`.
 
         Returns:
             tuple[jax.Array, None] -- (per-timestep flow-matching loss
-            [*b, action_horizon], stats). stats is always None (see above).
+            [*b, action_horizon], stats). stats is always None -- B1 has no
+            aux loss term at all (no router, no load-balancing loss to
+            report), so this matches Arm A/D's own None contract exactly.
 
         Example input:
             model.compute_loss(rng, observation, actions, train=True)
@@ -418,16 +398,6 @@ class ArmDModel(HistoryPi0):
         )
 
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-        # NOTE: the load-balancing auxiliary loss (joint_gated_modulator.
-        # JointGatedModulator's balance_loss) is sown per-layer via
-        # self.sow("intermediates", ...) inside DualMemoryHistoryBlock and is
-        # independently verified in smoke_test.py by calling DualMemoryModule
-        # directly with mutable=["intermediates"]. Threading that value
-        # through this nnx_bridge-wrapped call into compute_loss's return is
-        # a follow-up for the (out-of-scope, per the approved plan) training
-        # script, since it depends on flax.nnx.bridge's specific mutable-
-        # collection passthrough API and should be pinned against the actual
-        # installed flax version rather than guessed here.
         return jnp.mean(jnp.square(v_t - u_t), axis=-1), None
 
     @override
@@ -443,10 +413,10 @@ class ArmDModel(HistoryPi0):
         What it does:
             Runs flow-matching inference (Euler integration from noise to an
             action chunk), conditioning every step's action-expert forward
-            pass on both memory streams via DualMemoryModule/
-            JointGatedModulator. Same control flow as HistoryPi0.sample_
-            actions' modulation branch, with the single mem_seq/mem_mask pair
-            doubled into the two streams.
+            pass on both memory streams via StaticMemoryModule/
+            StaticGatedModulator. Same control flow as ArmDModel.
+            sample_actions, with the single change of which module combines
+            the two streams' cross-attended results.
 
         Returns:
             Actions -- jax.Array [b, action_horizon, action_dim].

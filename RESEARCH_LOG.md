@@ -20,6 +20,11 @@ Single table of the key numbers, updated as they come in. This is the table you'
 |------|-----------|-------------------|--------|-------|-------|---------|
 | 2026-07-27 23:22 | P0 e2e pipeline check | FrameSamp+Modul, seed 42, PickXtimes, n=2 | Success rate | 1/2 (50%) | Not statistically meaningful (n=2) - sanity check only. Paper reports 65.22% Counting-suite avg for this variant. | 2026-07-27 23:17-23:22 entry |
 | 2026-07-28 00:14 | Full-eval harness validation | FrameSamp+Modul, seed 0, 6 tasks, n=6 | Success rate | 5/6 (83.3%) | Not statistically meaningful (n=6, all one seed, all episode 0 only) - harness correctness check only. | 2026-07-28 00:03-00:14 entry |
+| 2026-08-20 00:52 | Arm D pilot dataset preprocessing | DatasetProcessor, A10G, BinFill (100 episodes) | Wall time | ~65 min | Measured, not estimated. Extrapolates to ~4+ hours for all 4 pilot tasks. | 2026-08-20 00:52 entry |
+| 2026-08-23 19:06 | Arm D pilot run_tentative (real pipeline, warm-started) | ArmDModel, A10G, batch_size=4, 4-task Counting suite, LoRA VLM | Step-0 loss | 0.0025 | grad_norm=0.2746, llm_grad_norm=0.2660, param_norm=1887.97 -- finite, sane. 11/10 tentative steps completed, "Tentative run completed". | 2026-08-23 code-review + run_tentative entry |
+| 2026-08-23 19:03 | Arm D pilot batch_size OOM sweep on A10G (24GB) | ArmDModel dual-stream, run_tentative attempts | Post-rematerialization memory floor | bs16: ~18.75GiB (+5.39GiB req, OOM) / bs8: ~17.11GiB (+4.31GiB req, OOM) / bs4: fit | Halving 16->8 only dropped the floor ~1.6GiB -- most of the footprint is batch-independent (frozen 2.3B backbone + Arm D's doubled per-layer memory cross-attention), not batch-scaled activations. | 2026-08-23 code-review entry |
+| 2026-08-24 12:23 | Arm D pilot training, full run | ArmDModel, A10G, batch_size=4, 4-task Counting suite, LoRA VLM, seed 42, 10,000 steps | Final loss (step 9999) | 0.0014 | Completed in one shot, 2h30m wall-clock, well under the 6h Modal timeout. Checkpointed at steps 2000/4000/6000/8000/9999, published to HF Hub as Nkoni/arm-d-counting-suite-pilot/9999.zip for cross-account eval. | 2026-08-24 12:49 entry |
+| 2026-08-25 13:20 | Arm D pilot eval, COMPLETE (600/600) | ArmDPolicy (eval.arm_d_policy), noor-koni2002 account, T4, 3 seeds (0/42/7) x 4 tasks x 50 episodes/task -- full protocol, matches paper/full_eval.py's density exactly | Overall success rate | 600/600 done (100%), 58.17% overall | Final, complete result -- n=150/task, same statistical power as the paper's own numbers on these 4 tasks. Per-task: BinFill 37.3% (n=150) vs. paper's FrameSamp+Modul 39.56%/GroundSG+QwenVL 77.56%; PickXtimes 74.7% (n=150) vs. 87.33%/95.33%; SwingXtimes 83.3% (n=150) vs. 92.00%/5.11%; StopCube 37.3% (n=150) vs. 42.00%/0.44%. Arm D's overall avg (58.17%) sits between the paper's two single-stream baselines (65.22% perceptual avg, 44.61% symbolic avg) on this 4-task subset, closer to the perceptual side on every task -- consistent with the gate leaning perceptual where perceptual already wins big (SwingXtimes, StopCube), but not beating either baseline outright on any task. Batch ran across 3 resume cycles (paused/resumed at 157/600, 366/600, 478/600, each verified clean via show_results with no reset/duplication) then finished and exited on its own once the job list was exhausted -- no final stop needed. Full per-episode detail (all 600 rows: seed/task/episode_idx/outcome/steps) in arm_d_dynamic_fusion/eval/pilot_eval_episodes.csv. Standing caveat still applies (see README's "Fairness caveat"): Arm D got Counting-suite-specific fine-tuning neither baseline received, so this compares a fine-tuned+gated model against un-fine-tuned baselines, not the gate mechanism in isolation. | 2026-08-24/25 eval-progress-check entries |
 
 ---
 
@@ -29,6 +34,72 @@ Single table of the key numbers, updated as they come in. This is the table you'
 ---
 
 ## Log
+
+### 2026-08-24 17:15 — Arm D pilot eval: training complete, eval underway, paused mid-batch at 157/600
+**Tags:** #baseline #idea
+
+**Training.** The full 10,000-step pilot training run (2026-08-24, see Results Summary) completed cleanly in one shot on A10G, 2h30m wall-clock. Checkpoint (step 9999, ~7.9GB) published to a public HF Hub repo (`Nkoni/arm-d-counting-suite-pilot`) so evaluation could run from a separate Modal account with no dependency on the training account's private volumes — verified for real: logged into a second account (`noor-koni2002`), confirmed it started with zero volumes/secrets/apps, and the eval pipeline worked there end to end.
+
+**Eval setup.** New files: `eval/arm_d_policy.py` (`ArmDPolicy`, overriding `MME_VLA_Policy._prepare_history` to handle the `dual_symbolic_perceptual` representation_type the released policy class doesn't know about) and `eval/run_pilot_eval.py` (Modal batch harness, mirrors `modal_reproduction/full_eval.py`'s architecture). Subgoal source at eval time is the environment's oracle (`info["simple_subgoal_online"]`), same field the training data used — no VLM subgoal predictor needed, since this pilot's config uses uncorrupted oracle subgoals.
+
+**Bugs hit and fixed getting the eval pipeline working** (all on real runs, not caught by review): `huggingface_hub[cli]`'s `hf` command unreachable via subprocess in this image (tried two install methods, both failed for PATH/venv-mixing reasons already documented in `project_modal_image_gotchas.md` item 6 — fixed by using `huggingface_hub`'s Python API directly instead of the CLI, matching `build_pilot_dataset.py`'s existing pattern); `smoke_test()` missing the `sys.path`/`os.chdir` setup present in `PolicyServer.load()`, causing `ModuleNotFoundError: arm_d_dynamic_fusion`.
+
+**Protocol scaled up mid-run** (user request): started at 1 seed x 10 episodes/task x 4 tasks = 40 episodes, then scaled to match the paper/`full_eval.py`'s exact density — 3 seeds (0, 42, 7) x 50 episodes/task x 4 tasks = 600 episodes — for a genuine like-for-like comparison against the recorded `FrameSamp+Modul`/`GroundSG+QwenVL` baselines on these 4 tasks. Task count (4, not 16) stays a deliberate cut: Arm D was only fine-tuned on the Counting suite. Seed-parallel dispatch (one lane per seed) restored in `run_batch_remote` once seed count went from 1 to 3.
+
+**One real mistake this session:** launched the scaled-up 600-episode batch without stopping the still-running original 40-episode batch first — two apps ran concurrently for a few minutes before being caught and the redundant one stopped. Minor wasted GPU-time, no correctness issue (duplicate work on overlapping (seed,task,episode) triples, not corrupted results).
+
+**Status at pause (user-requested `modal app stop`, safe/resumable):** 157/600 episodes complete (26.2%), overall 54.14% success. Per-task (n≈39-40 each, NOT yet statistically meaningful vs. the target n=150/task): BinFill 42.5%, PickXtimes 69.2%, SwingXtimes 76.9%, StopCube 28.2% — vs. paper's FrameSamp+Modul (39.56/87.33/92.00/42.00) and GroundSG+QwenVL (77.56/95.33/5.11/0.44) on the same four. Full per-episode detail in `arm_d_dynamic_fusion/eval/pilot_eval_episodes.csv`. Resuming later needs no manual bookkeeping: `run_batch_remote` always computes pending-work as (full 600-job protocol) minus (whatever's already durably on the results volume), so re-invoking `run_batch` picks up exactly the remaining ~443 episodes.
+
+---
+
+### 2026-08-24 12:49 — Arm D pilot run_training: first launch silently torn down, `.spawn()` without `--detach` insufficient again
+**Tags:** #infra #failed
+
+**What happened:** launched the real 10k-step training run with `modal run arm_d_dynamic_fusion/training/launch_pilot_training.py::run_training` (no `--detach`). The local entrypoint's `run_training_remote.spawn(...)` call returned a function-call ID and printed "This keeps running on Modal's servers regardless of this local process" (per its own docstring's claim) — but a follow-up `modal app list` showed the app (`ap-MGelV7J0BWNSl8nxAqH36k`) as `stopped` with 0 tasks, and `modal app logs` for it showed nothing but `"Stopping app - local entrypoint completed."` No training actually ran.
+
+**Root cause:** the exact failure mode already documented in `feedback_modal_unattended_jobs.md` and hit once before in this project (`build_pilot_dataset.py`'s `run_all`, 2026-08-20 12:17 entry below) — `.spawn()` alone does not keep a function call alive once the app itself tears down when the local `modal run` CLI process exits normally; `modal run --detach` is required in addition. Should have applied this from memory before the first launch; didn't.
+
+**Fixed:** relaunched with `modal run --detach arm_d_dynamic_fusion/training/launch_pilot_training.py::run_training`. Confirmed via `modal app list` immediately after: new app (`ap-Gju1gkndlsqFHYsrkH2VvU`) shows `ephemeral (detached)` with 1 active task, i.e. actually running server-side this time.
+
+**Cost impact:** negligible — the failed launch never started a GPU container (0 tasks), so no GPU-hours were spent on it.
+
+**Process note:** same category of mistake as the 2026-08-20 12:17 incident below — a documented gotcha not checked before running. `launch_pilot_training.py`'s own `run_training` docstring/print statement asserts the `.spawn()`-survives-disconnect claim without the `--detach` caveat; worth fixing that docstring so it doesn't mislead the next invocation.
+
+---
+
+### 2026-08-20 12:17 — Arm D pilot dataset build: second attempt, died from local-client disconnect, ~87 GPU-min lost
+**Tags:** #infra #failed
+
+**What happened:** restarted `build_pilot_dataset.py::run_all` after fixing the timeout (previous entry below). Ran via a blocking `@app.local_entrypoint()` calling `.remote()` sequentially — no `.spawn()`, no `--detach`. Got to episode 87/100 of BinFill (again) before the local terminal process running `modal run` was killed by something in the local environment (root cause still unconfirmed — not a Modal-side error, not user- or assistant-initiated this time). `modal app logs` confirmed the actual cause of the job stopping: `"Stopping app - local client disconnected. Use \`modal run --detach\` to keep apps running even if your local client disconnects."` A same-session check right after the local kill showed the remote job still advancing (episode 86, ahead of the local process's last-seen episode 84) — misread at the time as evidence the remote job was independent of the local connection; it was actually just the propagation delay before Modal's own cancellation took effect at episode 87.
+
+**Root cause, and why it should have been caught before running:** `feedback_modal_unattended_jobs.md` (existing project memory, dated 2026-07-28) already documents this exact failure mode and its fix — `.spawn()` alone is insufficient (tested there: torn down within ~9 seconds of local disconnect without `-d`), both `.spawn()` and `modal run --detach` are required together. `run_all` used neither.
+
+**Fixed:** rewrote `run_all` to `.spawn()` a new `run_all_remote()` Modal function (which itself sequences download → build → norm_stats via `.remote()` calls made from *inside* a Modal function, staying server-side) instead of blocking locally. Will invoke with `modal run --detach` this time.
+
+**Cost impact:** ~87 GPU-minutes on A10G (~$1.60) lost to redoing BinFill a second time. Combined with the first incident's ~65 min, that's ~152 GPU-minutes (~$2.80) spent on BinFill-processing attempts that produced no durably-saved output, before a single successful end-to-end run.
+
+**Process note:** this and the previous entry are both cases of a mistake already sitting in project memory, word for word, that wasn't checked before writing/running the code. Added `[[feedback_check_gotchas_before_modal_code]]` to make this an explicit standing check rather than relying on remembering to look.
+
+---
+
+### 2026-08-20 00:52 — Arm D pilot dataset build: first real run, timeout misconfigured, ~70 GPU-min lost
+**Tags:** #infra #idea #failed
+
+**What happened:** ran `arm_d_dynamic_fusion/training/build_pilot_dataset.py::run_all` (download + preprocess + norm_stats for the 4-task Counting-suite pilot) for the first time on Modal A10G. Download stage (13.6GB, 4 task H5 archives + SigLIP feature-extraction weights) completed in a few minutes, no issues. Preprocessing stage (`DatasetProcessor`, computing SigLIP perceptual-memory features per frame) started on BinFill's 100 episodes and was still running well past the 3600s (1-hour) timeout I'd set on that Modal function -- a guess made with zero empirical timing, before this pipeline had ever been run.
+
+**Measured timing:** BinFill's 100 episodes (episode timesteps ranging ~270-1040, `kept_indices` roughly matching or exceeding timestep count) took ~65 minutes on A10G, start to finish. Extrapolated to all 4 tasks: ~4+ hours for the preprocessing stage alone, not the ~30-60 min I'd guessed when writing the script.
+
+**Stopped the run manually** (`modal app stop`) once this was noticed, rather than let it run into the timeout kill -- found in the same pass that `mme_vla_suite.dataset_builder.build_robomme_dataset.DatasetProcessor.__init__` unconditionally `shutil.rmtree`s its output directory on every call, with no resume/skip-already-done mechanism, so letting it die from timeout mid-way through task 2 would have meant a subsequent retry re-wipes and redoes BinFill's already-finished work too, not just the remaining tasks. Stopping now vs. letting the timeout kill it later were equivalent in outcome (same lost progress either way) but stopping now saved the extra GPU-minutes that would've been spent on work about to be discarded.
+
+**Fixed:** bumped `build_preprocessed_dataset`'s Modal timeout from 3600s to 6*3600s (21600s) -- generous margin over the observed ~4h, chosen deliberately larger than the measured time specifically because a second timeout means a second full from-scratch redo.
+
+**Also hit and fixed, same session:** `uv pip install pytest huggingface_hub` failed on both new Modal scripts (`build_pilot_dataset.py`, `launch_pilot_training.py`) with "No virtual environment found" -- needed `--system`, exactly the gotcha already documented in project memory (`project_modal_image_gotchas.md` item 6) before I wrote this code. Should have checked that file first; didn't.
+
+**Cost impact:** ~70 GPU-minutes on A10G (~$1.30 at current Modal pricing) spent on the killed run's BinFill processing, entirely wasted since it has to be redone under the corrected timeout. Small in absolute terms, but purely attributable to shipping a timeout guess instead of either measuring first or sizing it very generously from the start.
+
+**Status:** timeout fixed, about to re-run `run_all` from scratch. Not yet complete.
+
+---
 
 ### 2026-08-10 16:38 — B1 (static-fusion arm) scoped down; architecture built; smoke test found a real bug, still open
 **Tags:** #idea #infra #failed
