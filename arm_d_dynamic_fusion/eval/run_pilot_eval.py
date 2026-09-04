@@ -2,17 +2,16 @@
 run_pilot_eval.py
 
 Evaluates a trained Arm D checkpoint on the 4-task Counting suite pilot (see
-arm_d_dynamic_fusion/README.md, "Pilot: does the gate actually arbitrate?").
-Mirrors modal_reproduction/full_eval.py and modal_reproduction/e2e_episode.py's
-architecture (PolicyServer Modal Cls + real ManiSkill/RoboMME episode rollout,
-durable per-episode result files, resumable batch dispatch) with two changes:
+arm_d_dynamic_fusion/README.md). Mirrors modal_reproduction/full_eval.py and
+modal_reproduction/e2e_episode.py's architecture (PolicyServer Modal Cls +
+real ManiSkill/RoboMME episode rollout, durable per-episode result files,
+resumable batch dispatch) with two changes:
 
 1. The checkpoint is downloaded from the public HuggingFace Hub repo this
-   project published it to (Nkoni/arm-d-counting-suite-pilot -- see
-   training/upload_checkpoint.py), not read from a private Modal Volume in
-   one specific account. This script has no dependency on the
-   robomme-arm-d-pilot-training / robomme-mme-vla-ckpts volumes at all, so it
-   runs identically from any Modal account.
+   project published it to (see training/upload_checkpoint.py), not read
+   from a private Modal Volume in one specific account. This script has no
+   dependency on the robomme-arm-d-pilot-training / robomme-mme-vla-ckpts
+   volumes at all, so it runs identically from any Modal account.
 2. PolicyServer loads an ArmDPolicy (models.arm_d_pi0.ArmDConfig +
    eval.arm_d_policy.create_arm_d_trained_policy), and each simulator step
    additionally reads the environment's oracle subgoal
@@ -24,6 +23,22 @@ durable per-episode result files, resumable batch dispatch) with two changes:
    training data's TokenizePromptWithSymbolicMemory transform expects.
    robomme_policy_learning/ is not edited to get any of this -- only read
    from and subclassed.
+
+UPDATED 2026-09-01: HF_CKPT_REPO/HF_CKPT_LOCAL_NAME parameterized (previously
+hardcoded to the OLD two-cross-attention-plus-router pilot's "Nkoni/arm-d-
+counting-suite-pilot") to instead evaluate the early-fusion-no-warmstart
+checkpoint published as "Nkoni/arm-d-v1" (RESEARCH_LOG.md's 2026-08-31 entry).
+results_volume ALSO changed to a new volume ("robomme-arm-d-v1-eval-results")
+-- reusing the OLD one would have been silently wrong: run_batch_remote's
+resume logic treats any (seed, task_id, episode_idx) already present as
+"done" and skips it, and the old volume already has all 600 such keys
+completed for the OLD checkpoint, which would make this run of a DIFFERENT
+checkpoint report 0 new episodes needed. HF_CKPT_LOCAL_NAME (a new constant,
+independent of HF_CKPT_REPO's exact string) exists for the same reason on the
+local checkpoint cache path -- both checkpoints happen to be published at
+step 9999, so a shared local cache directory name would have made this
+script skip re-downloading and silently evaluate the OLD checkpoint's cached
+files instead of the new one.
 
 Run with:
     modal run --detach arm_d_dynamic_fusion/eval/run_pilot_eval.py::run_batch --max-new-episodes 40
@@ -46,8 +61,9 @@ BENCHMARK_LOCAL_DIR = str(  # str
 ARM_D_LOCAL_DIR = str(pathlib.Path(__file__).resolve().parent.parent)  # str, the arm_d_dynamic_fusion/ dir
 MANISKILL_FORK = "git+https://github.com/YinpeiDai/ManiSkill.git@07be6fbc66350ddca200abfb0a11b692f078f7fd"  # str
 
-HF_CKPT_REPO = "Nkoni/arm-d-counting-suite-pilot"  # str, public HF Hub model repo, no auth needed to download
+HF_CKPT_REPO = "Nkoni/arm-d-v1"  # str, public HF Hub model repo, no auth needed to download
 HF_CKPT_STEP = "9999"  # str
+HF_CKPT_LOCAL_NAME = "arm-d-v1"  # str, local cache subdirectory name -- independent of HF_CKPT_REPO's exact string so this checkpoint's cache never collides with the OLD "arm-d-counting-suite-pilot" checkpoint's cache on the same account/volume, even though both happen to be published at the same step number
 
 # Eval protocol scope, vs. the paper / modal_reproduction/full_eval.py's reproduction
 # of the released FrameSamp+Modul checkpoint (that script's own SEEDS/NUM_EPISODES/
@@ -71,11 +87,11 @@ MAX_STEPS = 1300  # int, matches the paper / modal_reproduction/full_eval.py's c
 
 app = modal.App("robomme-arm-d-pilot-eval")  # modal.App
 
-ckpt_volume = modal.Volume.from_name("robomme-arm-d-eval-ckpt-cache", create_if_missing=True)  # modal.Volume, local cache of the public HF checkpoint (this account's own -- created fresh wherever this runs)
-results_volume = modal.Volume.from_name("robomme-arm-d-pilot-eval-results", create_if_missing=True)  # modal.Volume
+ckpt_volume = modal.Volume.from_name("robomme-arm-d-eval-ckpt-cache", create_if_missing=True)  # modal.Volume, local cache of the public HF checkpoint (this account's own -- created fresh wherever this runs; shared with the OLD checkpoint's cache, safe because HF_CKPT_LOCAL_NAME subdirectories keep them apart)
+results_volume = modal.Volume.from_name("robomme-arm-d-v1-eval-results", create_if_missing=True)  # modal.Volume, a NEW volume distinct from the OLD checkpoint's "robomme-arm-d-pilot-eval-results" -- see module docstring for why sharing it would be silently wrong
 CKPT_VOLUME_PATH = "/ckpts"  # str
 RESULTS_VOLUME_PATH = "/results"  # str
-CKPT_DIR = f"{CKPT_VOLUME_PATH}/arm-d-counting-suite-pilot/{HF_CKPT_STEP}"  # str
+CKPT_DIR = f"{CKPT_VOLUME_PATH}/{HF_CKPT_LOCAL_NAME}/{HF_CKPT_STEP}"  # str
 
 # --- Policy-serving image (JAX/openpi/mme_vla_suite + arm_d_dynamic_fusion side) ---
 policy_image = (  # modal.Image
@@ -174,13 +190,13 @@ def download_checkpoint() -> str:
         download_checkpoint.remote()
 
     Example output:
-        "/ckpts/arm-d-counting-suite-pilot/9999"
+        "/ckpts/arm-d-v1/9999"
     """
     import subprocess  # module
 
     import huggingface_hub  # module
 
-    repo_dir = pathlib.Path(CKPT_VOLUME_PATH) / "arm-d-counting-suite-pilot"  # Path
+    repo_dir = pathlib.Path(CKPT_VOLUME_PATH) / HF_CKPT_LOCAL_NAME  # Path
     ckpt_dir = repo_dir / HF_CKPT_STEP  # Path
     zip_path = repo_dir / f"{HF_CKPT_STEP}.zip"  # Path
 
@@ -696,15 +712,19 @@ CSV_FIELDS = [  # list[str]
 
 
 @app.local_entrypoint()
-def dump_episodes(out_path: str = "arm_d_dynamic_fusion/eval/pilot_eval_episodes.csv"):
+def dump_episodes(out_path: str = "arm_d_dynamic_fusion/eval/v1_eval_episodes.csv"):
     """
     What it does:
         Writes every completed episode's full detail as its own self-
         descriptive row to a local CSV file, sorted newest-to-oldest by
         completion time, plus a companion column-reference README -- same
         convention and layout as modal_reproduction/full_eval.py's
-        dump_episodes/full_eval_episodes_README.md, just scoped to this
-        pilot's own fields (single seed, 4 tasks, Arm D's checkpoint id).
+        dump_episodes/full_eval_episodes_README.md (and this project's own
+        earlier pilot_eval_episodes.csv, for the OLD checkpoint), just
+        pointed at a different output filename so the two don't collide --
+        default changed 2026-09-01 to "v1_eval_episodes.csv" per the user's
+        explicit naming request, to keep this checkpoint's results clearly
+        distinguished from the OLD one's already-published CSV.
 
     Returns:
         None -- writes out_path + a README locally, prints a confirmation.
@@ -713,7 +733,7 @@ def dump_episodes(out_path: str = "arm_d_dynamic_fusion/eval/pilot_eval_episodes
         modal run arm_d_dynamic_fusion/eval/run_pilot_eval.py::dump_episodes
 
     Example output:
-        (stdout) "Wrote 40 episode records (newest first) to arm_d_dynamic_fusion/eval/pilot_eval_episodes.csv"
+        (stdout) "Wrote 600 episode records (newest first) to arm_d_dynamic_fusion/eval/v1_eval_episodes.csv"
     """
     import csv  # module
 
@@ -727,11 +747,14 @@ def dump_episodes(out_path: str = "arm_d_dynamic_fusion/eval/pilot_eval_episodes
 
     readme_path = pathlib.Path(out_path).with_name(pathlib.Path(out_path).stem + "_README.md")  # Path
     readme_path.write_text(
-        "# pilot_eval_episodes.csv - column reference\n\n"
-        "Raw per-episode results for Arm D's Counting-suite pilot evaluation "
-        "(arm_d_dynamic_fusion/README.md). One row per completed episode, newest "
-        "completion first. See that README's \"Fairness caveat\" section before "
-        "comparing these numbers directly to the paper's Table 3 baselines.\n\n"
+        "# v1_eval_episodes.csv - column reference\n\n"
+        "Raw per-episode results for Arm D's early-fusion (\"arm-d-v1\", no warm-start "
+        "for mem_attn_fused/mlp_fused -- see RESEARCH_LOG.md's 2026-08-30/31 entries) "
+        "Counting-suite evaluation (arm_d_dynamic_fusion/README.md). One row per "
+        "completed episode, newest completion first. See that README's \"Fairness "
+        "caveat\" section before comparing these numbers directly to the paper's "
+        "Table 3 baselines, and RESEARCH_LOG.md for the comparison against the OLD "
+        "(two-cross-attention-plus-router) checkpoint's own pilot_eval_episodes.csv.\n\n"
         "| Column | Meaning |\n"
         "|---|---|\n"
         "| completed_at_utc | When this episode finished, ISO 8601 UTC. See timestamp_source. |\n"

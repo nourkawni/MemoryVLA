@@ -2,35 +2,61 @@
 launch_pilot_training.py
 
 Trains Arm D on the 4-task Counting-suite pilot (see arm_d_dynamic_fusion/
-README.md, "Pilot: does the gate actually arbitrate?"). Constructs a
-TrainConfig directly and calls scripts/train.py's main() with it, the same
-"bypass the config registry rather than edit it" approach this project used
-before for an analogous dual-stream variant (see project memory) --
-mme_vla_suite.training.config._CONFIGS is never edited.
+README.md). Constructs a TrainConfig directly and calls scripts/train.py's
+main() with it, the same "bypass the config registry rather than edit it"
+approach this project used before for an analogous dual-stream variant (see
+project memory) -- mme_vla_suite.training.config._CONFIGS is never edited.
+
+UPDATED 2026-08-30 for the early-fusion redesign (README.md's "Fusion moved
+before cross-attention" section, RESEARCH_LOG.md's 2026-08-29 15:53 entry):
+EXP_NAME changed from the completed OLD-mechanism pilot's
+"counting-suite-pilot" to "counting-suite-early-fusion" specifically so this
+run gets its OWN checkpoint directory rather than colliding with (and, via
+_build_train_config's overwrite=True default, wiping) the old run's already-
+published results. The data pipeline, LoRA recipe, and batch/step schedule
+below are otherwise unchanged from the original pilot -- only the model
+architecture and warm-start rename target (see warm_start_loader.py) changed;
+TRAIN_CONFIG_NAME/DATA_REPO_ID stay "arm_d_pilot" since the underlying
+Counting-suite dataset itself didn't change.
+
+UPDATED AGAIN 2026-08-30 (second time same day): that first early-fusion run
+was stopped at step ~3150/10000 after measure_gate_arbitration.py/inspect_
+bias_lever.py found the warm-started mem_attn_fused was dominating attention
+toward perceptual regardless of the bias_sym/bias_perc correction term (see
+RESEARCH_LOG.md's 14:02 "stop and investigate" entry). EXP_NAME changed AGAIN
+to "counting-suite-early-fusion-no-warmstart" for this next attempt (warm_
+start_loader.WARM_START_FUSED_ATTENTION=False) -- both so it doesn't
+overwrite the stopped run's checkpoint (kept for reference/comparison) and so
+the two attempts stay clearly distinguishable by name.
 
 Recipe, per the user's explicit choice for this budget-limited pilot: LoRA-
 adapt the 2B VLM backbone (paligemma_variant="gemma_2b_lora"), full-train the
 300M action expert and every memory/gating module (symbolic_mem_encoder,
-perceptual_mem_encoder, joint_gated_modulator) -- NOT the released
-FrameSamp+Modul recipe, which fully fine-tunes all ~2.3B params across 4
-GPUs (see mme_vla_suite/training/config.py's registered "mme_vla_suite"
-TrainConfig: no lora variant set, fsdp_devices=4). This is a deliberate
-divergence for cost, not an oversight -- results from this pilot describe
-Arm D under a lighter recipe than the baseline was trained with, not a
-strict apples-to-apples training-method match. Single GPU (fsdp_devices=1).
+perceptual_mem_encoder, unified_memory_encoder, joint_gated_modulator) -- NOT
+the released FrameSamp+Modul recipe, which fully fine-tunes all ~2.3B params
+across 4 GPUs (see mme_vla_suite/training/config.py's registered
+"mme_vla_suite" TrainConfig: no lora variant set, fsdp_devices=4). This is a
+deliberate divergence for cost, not an oversight -- results from this pilot
+describe Arm D under a lighter recipe than the baseline was trained with, not
+a strict apples-to-apples training-method match. Single GPU (fsdp_devices=1).
 
 Depends on, in order:
   1. build_pilot_dataset.py's three steps (download, build, norm_stats) --
-     must have completed successfully first; this script does not check for
-     that and will fail loudly (FileNotFoundError) if they haven't.
-  2. warm_start_loader.ArmDWarmStartWeightLoader -- NOT YET independently
-     verified against the real checkpoint's key list (see that module's
-     docstring). This training run IS that verification, in effect: if the
-     rename is wrong, _load_weights_and_validate's at.check_pytree_equality
-     call inside scripts/train.py::init_train_state will raise a shape/key
-     mismatch before any GPU-hours are spent on an actual training step.
+     already completed for the original pilot and unaffected by the
+     architecture change (same dataset); this script does not re-check for
+     it and will fail loudly (FileNotFoundError) if it's somehow missing.
+  2. warm_start_loader.ArmDWarmStartWeightLoader, now with
+     WARM_START_FUSED_ATTENTION=False -- the mem_encoder->perceptual_mem_
+     encoder rename it still applies was already verified against the real
+     checkpoint (the first early-fusion attempt's successful run_tentative
+     and real training run, see RESEARCH_LOG.md's 2026-08-30 13:08 entry);
+     what's new here is mem_attn_fused/mlp_fused now deliberately falling
+     through to fresh init instead. run_tentative is still worth running
+     first regardless -- same safety net, cheap insurance against any other
+     regression before spending real GPU-hours.
   3. arm_d_data.ArmDDataset / ArmDModelTransformFactory -- the three
-     RoboMMEDataset/ModelTransformFactory gaps documented in that module.
+     RoboMMEDataset/ModelTransformFactory gaps documented in that module,
+     unaffected by the architecture change.
 
 robomme_policy_learning/ is not edited. ArmDDataset is substituted for
 RoboMMEDataset via monkeypatching mme_vla_suite.training.dataloader's already-
@@ -54,6 +80,7 @@ ARM_D_LOCAL_DIR = str(pathlib.Path(__file__).resolve().parent.parent)  # str, th
 
 TRAIN_CONFIG_NAME = "arm_d_pilot"  # str, must match build_pilot_dataset.py's assets output path
 DATA_REPO_ID = "arm_d_pilot"  # str, ditto
+EXP_NAME = "counting-suite-early-fusion-no-warmstart"  # str, this run's own checkpoint-directory identity (ckpts/{TRAIN_CONFIG_NAME}/{EXP_NAME}) -- distinct from both the old-mechanism pilot's "counting-suite-pilot" and the stopped warm-started early-fusion attempt's "counting-suite-early-fusion", so neither gets overwritten
 
 app = modal.App("robomme-arm-d-pilot-training")  # modal.App
 
@@ -101,7 +128,7 @@ def _build_train_config(num_train_steps: int, resum_ckpt_id: int | None = None):
         starting step 0 from the warm-start checkpoint -- the original,
         only-ever-fresh behavior. Passing a step number (one that
         list_checkpoints/check_checkpoints shows as actually saved under
-        TRAIN_VOLUME_PATH/ckpts/arm_d_pilot/counting-suite-pilot) instead sets
+        TRAIN_VOLUME_PATH/ckpts/arm_d_pilot/counting-suite-early-fusion) instead sets
         overwrite=False/resume=True/resum_ckpt_id=<that step>, so
         scripts/train.py's init_train_state loads THAT checkpoint's weights
         (mme_vla_suite.training.config.TrainConfig.__post_init__ raises if
@@ -154,7 +181,7 @@ def _build_train_config(num_train_steps: int, resum_ckpt_id: int | None = None):
     return _config.TrainConfig(
         name=TRAIN_CONFIG_NAME,
         project_name="robomme-arm-d-pilot",
-        exp_name="counting-suite-pilot",
+        exp_name=EXP_NAME,
         model=model_config,
         data=ArmDDataConfig(
             repo_id=DATA_REPO_ID,
@@ -317,7 +344,7 @@ def list_checkpoints() -> list[int]:
     What it does:
         Lists the training steps that actually have a saved checkpoint under
         this pilot's checkpoint directory (TRAIN_VOLUME_PATH/ckpts/arm_d_pilot/
-        counting-suite-pilot) -- i.e. the valid values for run_training's
+        counting-suite-early-fusion) -- i.e. the valid values for run_training's
         resum_ckpt_id after a run_training_remote call got cut off by its
         6h timeout before finishing num_train_steps. Reads the directory
         directly (each orbax-managed step is a numbered subdirectory) rather
@@ -337,7 +364,7 @@ def list_checkpoints() -> list[int]:
     """
     import pathlib  # module
 
-    ckpt_dir = pathlib.Path(TRAIN_VOLUME_PATH) / "ckpts" / TRAIN_CONFIG_NAME / "counting-suite-pilot"  # Path
+    ckpt_dir = pathlib.Path(TRAIN_VOLUME_PATH) / "ckpts" / TRAIN_CONFIG_NAME / EXP_NAME  # Path
     if not ckpt_dir.exists():
         return []
     steps = sorted(  # list[int]

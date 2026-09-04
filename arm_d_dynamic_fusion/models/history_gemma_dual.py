@@ -5,8 +5,11 @@ Forks mme_vla_suite.models.integration.history_gemma's HistoryBlock/Module to
 carry TWO memory streams (symbolic + perceptual) through the action expert
 instead of the released code's single stream, and to replace the single
 MemoryAttention + MemoryRMSNorm modulation call with
-joint_gated_modulator.JointGatedModulator when integration_type ==
-"dynamic_fusion".
+joint_gated_modulator.EarlyFusionModulator when integration_type ==
+"dynamic_fusion" -- which itself fuses the two streams into one memory
+sequence and runs a single cross-attention against it (see that module's
+docstring for the mechanism and why it changed from an earlier two-cross-
+attention-plus-router design).
 
 robomme_policy_learning/ is never edited -- everything outside the memory-
 modulation site (self-attention, RoPE, the per-timestep AdaLN-Zero FFN
@@ -39,7 +42,7 @@ import openpi.training.sharding as sharding
 
 from mme_vla_suite.models.integration.utils import _name
 
-from arm_d_dynamic_fusion.models.joint_gated_modulator import JointGatedModulator
+from arm_d_dynamic_fusion.models.joint_gated_modulator import EarlyFusionModulator
 
 
 @at.typecheck
@@ -85,7 +88,13 @@ class DualMemoryHistoryBlock(nn.Module):
         deterministic=True,  # bool, disables dropout when True
     ):
         if self.integration_type == "dynamic_fusion":
-            joint_modulator = JointGatedModulator(name="joint_gated_modulator")
+            # Attribute name "joint_gated_modulator" kept unchanged from the
+            # prior (post-attention-gate) design even though EarlyFusion
+            # Modulator's mechanism is completely different now -- this is
+            # what ArmDConfig.get_freeze_filter()'s `.*joint_gated_modulator.*`
+            # exemption regex matches on, so keeping the name avoids needing
+            # any change there.
+            joint_modulator = EarlyFusionModulator(name="joint_gated_modulator")
 
         xs = sharding.activation_sharding_constraint(xs)
         drop = (
@@ -124,7 +133,7 @@ class DualMemoryHistoryBlock(nn.Module):
                 # (last slot in xs), mirroring where history_gemma.py's
                 # single-stream modulation is inserted.
                 if i == len(xs) - 1 and self.integration_type == "dynamic_fusion":
-                    x, gate_stats = joint_modulator(  # noqa: PLW2901
+                    x, fusion_stats = joint_modulator(  # noqa: PLW2901
                         x,
                         mem_seq_sym[-1], mem_mask_sym[-1],
                         mem_seq_perc[-1], mem_mask_perc[-1],
@@ -132,10 +141,13 @@ class DualMemoryHistoryBlock(nn.Module):
                     # Collected per layer via nn.scan's "intermediates" axis
                     # (see DualMemoryModule.setup) -- the standard flax idiom
                     # for reading out per-scan-step diagnostics without
-                    # changing this block's carry/output structure.
-                    self.sow("intermediates", "gate_sym", gate_stats["gate_sym"])
-                    self.sow("intermediates", "gate_perc", gate_stats["gate_perc"])
-                    self.sow("intermediates", "balance_loss", gate_stats["balance_loss"])
+                    # changing this block's carry/output structure. No more
+                    # gate_sym/gate_perc/balance_loss (there's no trained
+                    # 2-way gate anymore, see joint_gated_modulator.py) --
+                    # attn_mass_sym/attn_mass_perc are a read-only record of
+                    # what the single fused cross-attention actually did.
+                    self.sow("intermediates", "attn_mass_sym", fusion_stats["attn_mass_sym"])
+                    self.sow("intermediates", "attn_mass_perc", fusion_stats["attn_mass_perc"])
 
                 x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(
                     x, adarms_cond[i]
@@ -174,8 +186,8 @@ class DualMemoryModule(nn.Module):
         depth, supporting Arm D's two simultaneous memory streams. Identical
         to history_gemma.Module except __call__ takes mem_seq_sym/mem_mask_sym
         and mem_seq_perc/mem_mask_perc instead of a single mem_seq/mem_mask,
-        and the scan collects each layer's gate/balance-loss diagnostics via
-        a `variable_axes={"intermediates": 0}` collection.
+        and the scan collects each layer's attn_mass_sym/attn_mass_perc
+        diagnostics via a `variable_axes={"intermediates": 0}` collection.
 
     Returns:
         n/a -- see __call__.

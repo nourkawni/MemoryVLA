@@ -51,6 +51,8 @@ from mme_vla_suite.models.representation.percep_mem import PerceptualMemory
 
 from arm_d_dynamic_fusion.models import history_gemma_dual as _dual_gemma
 from arm_d_dynamic_fusion.models.symbolic_mem_encoder import SymbolicMemoryEncoder
+from arm_d_dynamic_fusion.models.unified_memory_encoder import UnifiedMemoryEncoder
+from arm_d_dynamic_fusion.models.unified_memory_encoder import contrastive_alignment_loss
 
 
 REPRESENTATION_TYPE = "dual_symbolic_perceptual"  # str, this arm's history_config.representation_type
@@ -77,6 +79,8 @@ class ArmDConfig(HistoryPi0Config):
     Example output:
         an ArmDConfig instance.
     """
+
+    alignment_loss_weight: float = 0.1  # float, weight on contrastive_alignment_loss (see compute_loss) -- addresses the zero-correspondence finding in RESEARCH_LOG.md's 2026-08-28 21:24 entry. Not yet tuned. (balance_loss_weight, from the earlier post-attention-gate design, was removed 2026-08-29 along with the 2-way gate it applied to -- see joint_gated_modulator.py's module docstring for why a load-balancing loss doesn't apply to the current early-fusion mechanism.)
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "ArmDModel":
@@ -180,14 +184,16 @@ class ArmDConfig(HistoryPi0Config):
             modules from the frozen-VLM-backbone filter by matching `.*mem.*`
             in the "/"-joined nnx state path (see nnx_utils.PathRegex). That
             regex does not match `joint_gated_modulator`, the module name
-            JointGatedModulator is instantiated under in
+            EarlyFusionModulator is instantiated under (unchanged from the
+            prior JointGatedModulator design specifically so this exemption
+            keeps matching -- see joint_gated_modulator.py) in
             history_gemma_dual.DualMemoryHistoryBlock -- the one new
             mechanism this arm exists to train. Left unfixed, the base
             filter would freeze it (it sits inside the `.*llm.*`-matching
             scanned stack and isn't excluded), training everything else
-            while the gate itself never moves off its zero-init identity
-            state. This override additionally exempts it, on top of every-
-            thing the base filter already exempts (mem_attn_perc,
+            while the fusion mechanism itself never moves off its near-
+            identity init state. This override additionally exempts it, on
+            top of everything the base filter already exempts (mem_attn_perc,
             symbolic_mem_encoder, perceptual_mem_encoder, LoRA adapters).
 
         Returns:
@@ -253,6 +259,12 @@ class ArmDModel(HistoryPi0):
             embed_dim=paligemma_config.width,
             output_dim=action_expert_config.width,
         )  # builds M_sym: PaliGemma subgoal-token embeddings -> width 1024
+        self.unified_memory_encoder = UnifiedMemoryEncoder(
+            rngs=rngs,
+            dtype=config.dtype,
+            width=action_expert_config.width,
+            hidden_dim=action_expert_config.width,
+        )  # shared post-projection encoder, applied to BOTH streams (see embed_memory) -- top-level attribute name contains "mem", so it's automatically exempted from HistoryPi0Config.get_freeze_filter()'s frozen-backbone regex the same way symbolic_mem_encoder/perceptual_mem_encoder already are, no freeze-filter change needed.
 
         print(
             "====== Arm D: dynamic cross-modal gated fusion "
@@ -308,7 +320,17 @@ class ArmDModel(HistoryPi0):
             Builds both memory streams for one batch: M_perc via the
             unchanged PerceptualMemory encoder, M_sym via PaliGemma's
             embedder (width 2048) followed by SymbolicMemoryEncoder's
-            projection to width 1024.
+            projection to width 1024 -- then routes BOTH streams through the
+            same UnifiedMemoryEncoder instance (shared weights) before
+            returning them. Added after RESEARCH_LOG.md's 2026-08-28 21:24/
+            22:14 diagnostics found the two streams had zero measured
+            representation-space correspondence and a large, growing raw-
+            magnitude mismatch on the pre-existing checkpoint; see
+            unified_memory_encoder.py for what this step actually does about
+            that (RMSNorm for the magnitude mismatch; the shared weights
+            alone are necessary but not sufficient for alignment --
+            contrastive_alignment_loss in compute_loss is what supplies the
+            training signal that targets it).
 
         Returns:
             tuple[jax.Array, jax.Array, jax.Array, jax.Array] --
@@ -336,6 +358,9 @@ class ArmDModel(HistoryPi0):
             subgoal_embeddings, obs.symbolic_tokenized_prompt_mask
         )  # jax.Array [b, l_sym, 1024], jax.Array [b, l_sym]
 
+        mem_sym_tokens = self.unified_memory_encoder(mem_sym_tokens)  # jax.Array [b, l_sym, 1024]
+        mem_perc_tokens = self.unified_memory_encoder(mem_perc_tokens)  # jax.Array [b, l_perc, 1024], SAME weights as the sym call above
+
         return mem_sym_tokens, mem_sym_mask, mem_perc_tokens, mem_perc_mask
 
     @override
@@ -346,42 +371,83 @@ class ArmDModel(HistoryPi0):
         actions: Actions,
         *,
         train: bool = False,
-    ) -> tuple[at.Float[at.Array, "*b ah"], None]:
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict]:
         """
         What it does:
             One flow-matching training step: noises the action chunk, runs
-            the dual-memory action expert to predict the denoising velocity,
-            and returns the per-timestep squared error -- identical training
-            objective to every other MME-VLA variant (HistoryPi0.compute_loss),
-            routed through DualMemoryModule instead of history_gemma.Module.
+            the dual-memory action expert (now: EarlyFusionModulator's single
+            fused cross-attention per layer, see joint_gated_modulator.py)
+            to predict the denoising velocity, and adds contrastive_
+            alignment_loss between the two (now-unified, see embed_memory)
+            memory streams, weighted by config.alignment_loss_weight, into
+            the per-timestep flow-matching loss. Added because RESEARCH_
+            LOG.md's 2026-08-28 21:24 entry found zero representation-space
+            correspondence between M_sym/M_perc on the pre-existing trained
+            checkpoint -- nothing was training the two streams toward a
+            shared space.
+
+            Also extracts EarlyFusionModulator's per-layer attn_mass_sym/
+            attn_mass_perc (read-only diagnostics, NOT part of the loss --
+            see joint_gated_modulator.py for what they mean) by reading
+            JointGatedModulator's `self.sow("intermediates", ...)` values out
+            of the scanned action-expert stack, which only flax's own
+            `mutable=["intermediates"]` mechanism exposes. Passing
+            mutable=["intermediates"] to the nnx-wrapped call directly
+            (self.PaliGemma.llm(..., mutable=[...])) does NOT surface
+            anything for this installed flax version (confirmed via a
+            smoke_test.py check) -- it silently returns the same
+            (outputs, kv_cache) 2-tuple as an ordinary call. What DOES work,
+            used below (verified via smoke_test.py and arm_d_dynamic_fusion/
+            analysis/measure_gate_arbitration.py's real extraction from a
+            trained checkpoint, under the prior gate-based design): extract
+            the wrapped flax.linen.Module directly (`self.PaliGemma.llm.
+            module`) and its current trained params (`nnx.state(self.
+            PaliGemma.llm, nnx.Param).to_pure_dict()`), then call
+            `.apply(variables, ..., mutable=["intermediates"])` on the linen
+            module directly -- the plain flax.linen calling convention,
+            bypassing nnx_bridge's opaque nested-mutable handling entirely.
+            Numerically identical to the nnx-wrapped call (same params, same
+            math, same JAX trace -- autodiff follows the computation graph
+            regardless of which wrapper reads the param values into it, not
+            the module boundary), just with the intermediates collection
+            actually surfaced.
 
             Returns a (loss, stats) 2-tuple, not a bare array: scripts/train.py's
             train_step unconditionally does `chunked_loss, stats =
-            model.compute_loss(...)` (see loss_fn inside train_step), and every
-            branch of the base HistoryPi0.compute_loss this overrides ends in
-            `return jnp.mean(...), stats` -- including the "modulation"
-            integration branch (Arm A's own code path), where stats is already
-            always None since PerceptualMemory's __call__ returns its third
-            element as None. stats=None here matches that exactly: it's a valid
-            aux value under nnx.value_and_grad(..., has_aux=True), and
-            train.py's only later use of it (`if config...representation_type
-            == "recurrent" and history_config.recurrent_memory.output_stats`,
-            around line 428) short-circuits before ever touching it, since
-            Arm D's representation_type is "dual_symbolic_perceptual", not
-            "recurrent". A bare array here (this override's original form)
-            makes that unpack fail immediately -- the smoke test didn't catch
-            it because it calls compute_loss directly with a single-variable
-            assignment, which doesn't require a 2-tuple return.
+            model.compute_loss(...)` (see loss_fn inside train_step). stats is
+            a real diagnostics dict -- train.py's only other use of it
+            (`if config...representation_type == "recurrent" and
+            history_config.recurrent_memory.output_stats`) short-circuits
+            before ever touching it for Arm D, whose representation_type is
+            "dual_symbolic_perceptual", so this is safe. Only `chunked_loss`
+            (via `jnp.mean(chunked_loss)` in train_step's loss_fn) is
+            differentiated -- has_aux=True means `stats` never contributes to
+            gradients -- which is why alignment_loss is added directly into
+            chunked_loss's per-timestep value (broadcasting a scalar across
+            it is mathematically equivalent to adding that scalar to
+            jnp.mean(chunked_loss) after the fact, since mean is linear), not
+            just reported via stats.
 
         Returns:
-            tuple[jax.Array, None] -- (per-timestep flow-matching loss
-            [*b, action_horizon], stats). stats is always None (see above).
+            tuple[jax.Array, dict] -- (combined per-timestep loss
+            [*b, action_horizon], stats). stats has keys "flow_matching_loss"
+            (jax.Array [*b, ah], the unweighted component, for comparison),
+            "alignment_loss" (scalar), "attn_mass_sym_mean" (scalar),
+            "attn_mass_perc_mean" (scalar) -- the last two are read-only
+            diagnostics (not part of the loss), included so future training
+            runs can watch how the single fused cross-attention is actually
+            splitting its attention between streams without needing a
+            separate offline script each time (see measure_gate_
+            arbitration.py, which will need updating to match this design --
+            not yet done).
 
         Example input:
             model.compute_loss(rng, observation, actions, train=True)
 
         Example output:
-            (Array of shape (batch_size, action_horizon), None)
+            (Array of shape (batch_size, action_horizon),
+             {"flow_matching_loss": Array(...), "alignment_loss": Array(1.1),
+              "attn_mass_sym_mean": Array(0.31), "attn_mass_perc_mean": Array(0.69)})
         """
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = preprocess_observation(preprocess_rng, observation, train=train)
@@ -406,7 +472,18 @@ class ArmDModel(HistoryPi0):
 
         mem_sym, mem_sym_mask, mem_perc, mem_perc_mask = self.embed_memory(observation)
 
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+        llm_variables = {"params": nnx.state(self.PaliGemma.llm, nnx.Param).to_pure_dict()}  # dict, current (possibly mid-training) params as a flax.linen-compatible variables dict
+        # Three unpacking levels, not two: DualMemoryModule.__call__ returns
+        # its own (outputs, kv_cache) 2-tuple (outputs itself being
+        # [prefix_out, suffix_out]), and .apply(..., mutable=[...]) wraps
+        # THAT whole thing as element 0 of ITS OWN outer 2-tuple, with the
+        # sown collections as element 1 -- exactly the shape smoke_test.py's
+        # CHECK2 already established for this same call. Collapsing this to
+        # two levels (an earlier version of this line) silently bound
+        # `suffix_out` to `kv_cache` instead, caught immediately by
+        # smoke_test.py's CHECK3 (TypeError on the next line's slice).
+        (outputs, kv_cache), mutated = self.PaliGemma.llm.module.apply(
+            llm_variables,
             [prefix_tokens, suffix_tokens],
             mask=attn_mask,
             positions=positions,
@@ -415,20 +492,35 @@ class ArmDModel(HistoryPi0):
             mem_mask_sym=[None, mem_sym_mask],
             mem_seq_perc=[None, mem_perc],
             mem_mask_perc=[None, mem_perc_mask],
+            mutable=["intermediates"],
         )
+        prefix_out, suffix_out = outputs
+
+        # Sown per-layer values, shape [depth, b, t, 1] (see
+        # joint_gated_modulator.py/history_gemma_dual.py) -- reduced to
+        # scalars for stats here since the diagnostic doesn't need per-layer
+        # resolution day to day (a per-layer breakdown is still available via
+        # a future update to measure_gate_arbitration.py for deeper
+        # investigation -- not yet done for this design).
+        intermediates = mutated["intermediates"]["layers"]  # dict[str, tuple[jax.Array, ...]]
+        attn_mass_sym_mean = jnp.mean(intermediates["attn_mass_sym"][0])  # jax.Array []
+        attn_mass_perc_mean = jnp.mean(intermediates["attn_mass_perc"][0])  # jax.Array []
 
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-        # NOTE: the load-balancing auxiliary loss (joint_gated_modulator.
-        # JointGatedModulator's balance_loss) is sown per-layer via
-        # self.sow("intermediates", ...) inside DualMemoryHistoryBlock and is
-        # independently verified in smoke_test.py by calling DualMemoryModule
-        # directly with mutable=["intermediates"]. Threading that value
-        # through this nnx_bridge-wrapped call into compute_loss's return is
-        # a follow-up for the (out-of-scope, per the approved plan) training
-        # script, since it depends on flax.nnx.bridge's specific mutable-
-        # collection passthrough API and should be pinned against the actual
-        # installed flax version rather than guessed here.
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1), None
+        flow_matching_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # jax.Array [*b, ah]
+        alignment_loss = contrastive_alignment_loss(mem_sym, mem_sym_mask, mem_perc, mem_perc_mask)  # jax.Array []
+
+        chunked_loss = (
+            flow_matching_loss + self.config.alignment_loss_weight * alignment_loss
+        )  # jax.Array [*b, ah] -- scalar broadcasts across the last axis; see docstring for why this (not `stats`) is where it must live to reach the optimizer
+
+        stats = {
+            "flow_matching_loss": flow_matching_loss,
+            "alignment_loss": alignment_loss,
+            "attn_mass_sym_mean": attn_mass_sym_mean,
+            "attn_mass_perc_mean": attn_mass_perc_mean,
+        }
+        return chunked_loss, stats
 
     @override
     def sample_actions(

@@ -18,6 +18,16 @@ repo is a drop-in target for the same download_checkpoint()/unzip_ckpt.py
 pattern -- no new download-side code needed, just point CKPT_REPO at
 HF_REPO_ID instead of "Yinpei/perceptual-framesamp-modul".
 
+UPDATED 2026-08-31: EXP_NAME/HF_REPO_ID parameterized (previously hardcoded
+to the OLD two-cross-attention-plus-router pilot's "counting-suite-pilot" /
+"Nkoni/arm-d-counting-suite-pilot") so this script can publish ANY of this
+project's checkpoints, not just that one specific run. Defaults now point at
+the early-fusion-no-warmstart run's finished checkpoint (RESEARCH_LOG.md's
+2026-08-30/31 entries), published as "Nkoni/arm-d-v1" -- named "v1" per the
+user's explicit request, specifically to distinguish it from the OLD
+mechanism's checkpoint (still separately published at
+"Nkoni/arm-d-counting-suite-pilot", untouched by this change).
+
 Run with:
     modal run arm_d_dynamic_fusion/training/upload_checkpoint.py::main --step 9999
 """
@@ -27,7 +37,8 @@ import pathlib
 import modal
 
 TRAIN_VOLUME_PATH = "/pilot_training"  # str, must match launch_pilot_training.py
-HF_REPO_ID = "Nkoni/arm-d-counting-suite-pilot"  # str, public HF Hub model repo
+EXP_NAME = "counting-suite-early-fusion-no-warmstart"  # str, must match launch_pilot_training.py's EXP_NAME for the run being published
+HF_REPO_ID = "Nkoni/arm-d-v1"  # str, public HF Hub model repo -- "v1" distinguishes this (early-fusion, no-warmstart) checkpoint from the OLD mechanism's "Nkoni/arm-d-counting-suite-pilot"
 
 app = modal.App("robomme-arm-d-checkpoint-upload")  # modal.App
 
@@ -50,11 +61,11 @@ def upload(step: int = 9999) -> str:
     """
     What it does:
         Zips the orbax checkpoint directory for the given training step
-        (TRAIN_VOLUME_PATH/ckpts/arm_d_pilot/counting-suite-pilot/<step>,
-        containing "params/" and "assets/") with the step number as the
-        zip's top-level internal directory, then uploads that single
-        "<step>.zip" file to HF_REPO_ID's repo root -- creating the repo
-        (public, model type) first if it doesn't exist yet.
+        (TRAIN_VOLUME_PATH/ckpts/arm_d_pilot/{EXP_NAME}/<step>, containing
+        "params/" and "assets/") with the step number as the zip's top-level
+        internal directory, then uploads that single "<step>.zip" file to
+        HF_REPO_ID's repo root -- creating the repo (public, model type)
+        first if it doesn't exist yet.
 
     Returns:
         str -- the HF Hub URL of the uploaded file.
@@ -63,14 +74,14 @@ def upload(step: int = 9999) -> str:
         upload.remote(step=9999)
 
     Example output:
-        "https://huggingface.co/Nkoni/arm-d-counting-suite-pilot/blob/main/9999.zip"
+        "https://huggingface.co/Nkoni/arm-d-v1/blob/main/9999.zip"
     """
     import os  # module
     import subprocess  # module
 
     from huggingface_hub import HfApi  # huggingface_hub.HfApi
 
-    ckpt_root = pathlib.Path(TRAIN_VOLUME_PATH) / "ckpts" / "arm_d_pilot" / "counting-suite-pilot"  # Path
+    ckpt_root = pathlib.Path(TRAIN_VOLUME_PATH) / "ckpts" / "arm_d_pilot" / EXP_NAME  # Path
     step_dir = ckpt_root / str(step)  # Path
     if not step_dir.exists():
         raise FileNotFoundError(
@@ -114,6 +125,6 @@ def main(step: int = 9999):
         modal run arm_d_dynamic_fusion/training/upload_checkpoint.py::main --step 9999
 
     Example output:
-        (stdout) "https://huggingface.co/Nkoni/arm-d-counting-suite-pilot/blob/main/9999.zip"
+        (stdout) "https://huggingface.co/Nkoni/arm-d-v1/blob/main/9999.zip"
     """
     print(upload.remote(step=step))

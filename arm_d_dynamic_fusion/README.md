@@ -16,29 +16,41 @@ that only ever sees one stream at a time structurally cannot express.
 
 ## Architecture
 
-Both memory streams are admitted as fixed-width token sequences, `M_sym in R^(B x 64 x 1024)`
-and `M_perc in R^(B x 512 x 1024)`, at the action expert's AdaLN modulation site (RoboMME's
-best-performing integration site). Per action-expert layer *k*:
+**Current design (as of 2026-08-29 -- see "Fusion moved before cross-attention" below for
+why this replaced an earlier two-cross-attention-plus-router version).** Both memory
+streams are admitted as fixed-width token sequences, `M_sym in R^(B x 64 x 1024)` and
+`M_perc in R^(B x 512 x 1024)`, first passed through a shared `UnifiedMemoryEncoder` (see
+"Pre-fusion representation unification" below) so every token, regardless of stream, is
+measured in the same units. Per action-expert layer *k*:
 
 ```
-r_sym  = MHA(Q = s_k, K = V = M_sym)
-r_perc = MHA(Q = s_k, K = V = M_perc)
-g_k    = softmax(W_route . [r_sym ; r_perc])        in R^2
-(gamma_k, beta_k) = g_sym . MLP_sym(r_sym) + g_perc . MLP_perc(r_perc)
-s_hat  = gamma_k (*) Norm(s_k) + beta_k
+M_sym'  = M_sym  + tag_sym                          (learned per-layer "I am symbolic" vector)
+M_perc' = M_perc + tag_perc                         (learned per-layer "I am perceptual" vector)
+M_fused = concat(M_sym', M_perc')                   in R^(B x 576 x 1024), ONE sequence
+r_k     = MHA(Q = s_k, K = V = M_fused, score_bias = bias_sym | bias_perc per position)
+(gamma_k, beta_k) = MLP_fused(r_k)
+s_hat   = gamma_k (*) Norm(s_k) + beta_k
 ```
 
-`W_route` and both MLPs are (near-)zero-init, so the model starts as an exact identity
-modulation with a uniform 0.5/0.5 gate -- fine-tuning is what teaches the router to
-suppress one stream when the other should dominate.
+One cross-attention per layer, not two -- there is no router combining separate per-stream
+results anymore. `bias_sym`/`bias_perc` (two learned scalars per layer, zero-init) exist
+specifically to counter a verified numerosity effect: a plain softmax over 64 symbolic +
+512 perceptual tokens defaults to assigning roughly equal weight per *token*, so
+perceptual's 8x count advantage claims most of the attention mass by default, independent
+of content (confirmed empirically, not just theoretically -- see that section). `MLP_fused`
+is near-zero-init, so the model starts as an exact identity modulation at init, same as the
+prior design.
 
 | File | Role |
 |---|---|
 | `models/symbolic_mem_encoder.py` | Builds `M_sym`: PaliGemma subgoal-token embeddings -> Linear(2048->1024). |
-| `models/joint_gated_modulator.py` | The mechanism above: per-stream cross-attention, joint router, AdaLN-Zero combine, load-balance loss. |
+| `models/unified_memory_encoder.py` | Shared post-projection step, applied to both streams (see "Pre-fusion representation unification" below), plus `contrastive_alignment_loss`. |
+| `models/joint_gated_modulator.py` | The mechanism above: modality tags, concatenation, one fused cross-attention (`FusedMemoryAttention`, forked from the released `MemoryAttention`) with a learned per-stream score bias, one AdaLN-Zero MLP. Class is `EarlyFusionModulator` (nnx attribute name `joint_gated_modulator` kept for freeze-filter compatibility -- see "Fusion moved before cross-attention" below). |
 | `models/history_gemma_dual.py` | Forked `HistoryBlock`/`Module` (from `history_gemma.py`) carrying two memory streams through the scanned transformer stack instead of one. |
 | `models/arm_d_pi0.py` | `ArmDConfig`/`ArmDModel`, subclassing `HistoryPi0Config`/`HistoryPi0`, wiring both encoders + the dual gemma module into a runnable policy. |
 | `config/dynamic-fusion-arm-d.yaml` | Arm D's history-representation config (perceptual budget 512, `dynamic_fusion` integration). |
+| `analysis/measure_representation_alignment.py` | Diagnostic: measures matched-vs-shuffled retrieval accuracy between `M_sym`/`M_perc`, on real data. |
+| `analysis/measure_gate_arbitration.py` | Diagnostic: measures the fused cross-attention's actual `attn_mass_sym`/`attn_mass_perc` split, on real data. Not currently runnable -- needs a checkpoint trained under the early-fusion mechanism (the published step-9999 checkpoint predates it). |
 
 ## Recorded design decision: two projectors, not one shared matrix
 
@@ -60,6 +72,148 @@ one). This keeps the substantive point of section 3.2 -- both streams admitted a
 `M in R^(B x d)` at the modulator, symmetric treatment, no VLM-context/modulator asymmetry
 -- without the literal weight-tying.
 
+## Pre-fusion representation unification (added 2026-08-29)
+
+Two problems were found empirically on the trained Counting-suite pilot checkpoint
+(step 9999), on real data, not guessed from reading the architecture (see
+RESEARCH_LOG.md's 2026-08-28 21:24 and 22:14 entries and the two `analysis/` scripts
+above that measured them):
+
+1. **Zero representation-space correspondence between the streams.** Matched-pair
+   (same training example) cosine similarity between `M_sym` and `M_perc` was
+   statistically indistinguishable from shuffled/mismatched pairs, both before and
+   after training -- retrieval accuracy sat exactly at the chance floor. Same output
+   width (1024, both streams) is not the same thing as a shared representation space:
+   nothing was training the two projectors toward each other, only the downstream
+   flow-matching loss, filtered through the gate.
+2. **Full gate collapse.** The trained checkpoint's gate assigned ~100.000% weight to
+   the perceptual stream and ~0.001% to the symbolic stream, uniformly across all 18
+   layers and every example measured (zero variance) -- not "leans perceptual", a fixed
+   switch. `JointGatedModulator`'s `balance_loss`, the mechanism specifically meant to
+   prevent this, was implemented but never reached the optimizer (see below).
+
+Fix, in `models/unified_memory_encoder.py`, wired into `arm_d_pi0.ArmDModel`:
+
+- **`UnifiedMemoryEncoder`**: a parameter-free RMSNorm (both streams had also drifted to
+  a large and growing raw-magnitude mismatch -- perceptual tokens ~15x larger in RMS
+  norm than symbolic tokens post-training, up from ~9x at init) followed by a small
+  residual MLP with a near-zero-initialized output projection. The SAME module instance
+  (identical weights) is called on both `M_sym` and `M_perc` in `ArmDModel.embed_memory`,
+  forcing both through one shared transform instead of each keeping a private one
+  forever. The shared weights alone don't guarantee alignment, though --
+- **`contrastive_alignment_loss`**: a symmetric InfoNCE loss between the two streams'
+  per-example mean-pooled summaries (matched pair = same training example), added into
+  `ArmDModel.compute_loss`'s objective, weighted by `ArmDConfig.alignment_loss_weight`
+  (default 0.1, not yet tuned). This is the actual training signal targeting problem 1.
+- **`balance_loss` wired in**: `compute_loss` now extracts `JointGatedModulator`'s
+  per-layer load-balancing loss (previously computed but discarded) and adds it,
+  weighted by `ArmDConfig.balance_loss_weight` (default 0.01, matching the Switch
+  Transformer convention this loss's docstring cites, not yet tuned against this
+  project's own data), directly targeting problem 2.
+
+**How the balance_loss extraction actually works** (this was the specific piece
+previously left unresolved as "should be pinned against the actual installed flax
+version rather than guessed" -- now resolved empirically): `JointGatedModulator`'s
+`gate_sym`/`gate_perc`/`balance_loss` are sown per-layer inside a `flax.linen` `nn.scan`,
+retrievable only via flax's own `mutable=["intermediates"]` mechanism. Passing
+`mutable=["intermediates"]` directly to the `nnx_bridge`-wrapped call
+(`self.PaliGemma.llm(..., mutable=[...])`) was tried first and does NOT surface anything
+for this installed flax version -- it silently returns the same `(outputs, kv_cache)`
+2-tuple as an ordinary call (confirmed via `smoke_test.py`'s CHECK4). What works instead,
+used in `compute_loss` now: extract the wrapped `flax.linen.Module` directly
+(`self.PaliGemma.llm.module`) and its current trained params
+(`nnx.state(self.PaliGemma.llm, nnx.Param).to_pure_dict()`), then call
+`.apply(variables, ..., mutable=["intermediates"])` on the linen module directly --
+ordinary flax.linen, bypassing `nnx_bridge`'s opaque nested-mutable handling. Numerically
+identical to the nnx-wrapped call (same params, same math); gradients still flow
+correctly since autodiff follows the JAX computation graph regardless of which wrapper
+reads the parameter values into it, not the module boundary.
+
+`compute_loss`'s `stats` return value also changed from always-`None` to a real
+diagnostics dict (`flow_matching_loss`/`balance_loss`/`alignment_loss`/`gate_sym_mean`/
+`gate_perc_mean`) -- safe, since `scripts/train.py`'s only other use of `stats` is gated
+on `representation_type == "recurrent"`, which never matches Arm D. Verified end-to-end
+(not just "runs without crashing") by `smoke_test.py`'s updated CHECK3: on a fresh
+random-init model, `gate_sym_mean`/`gate_perc_mean` are still exactly 0.5/0.5 and
+`balance_loss` is still ~0, confirming the new extraction reads the real gate values
+rather than a disconnected constant.
+
+**Not yet done:** retraining with these changes (the existing step-9999 checkpoint
+predates all of this) and re-running the alignment/gate diagnostics against a new
+checkpoint to confirm the fix actually worked, not just that it's wired correctly.
+`balance_loss_weight`/`alignment_loss_weight` are first-guess defaults, not tuned.
+
+**Superseded 2026-08-29** (see next section): `balance_loss`/`gate_sym`/`gate_perc` and the
+two-cross-attention-plus-router design they belonged to were replaced by a single fused
+cross-attention with no router. `contrastive_alignment_loss`/`UnifiedMemoryEncoder` above
+are unaffected and remain exactly as described -- unification of the two streams'
+representation space is a precondition for the new design, not something it replaces.
+
+## Fusion moved before cross-attention (early fusion, added 2026-08-29)
+
+Per the user's supervisor's explicit direction: fuse the two memory streams into ONE
+representation *before* cross-attention, with a single cross-attention reading that fused
+memory -- not the two-cross-attention-plus-router design above. Discussed with the user
+first: concatenating two streams into one sequence only makes sense once every token is
+measured in the same units, which is exactly what the unification work above already
+provides -- these two changes are sequenced deliberately, not independent design choices.
+
+See the "Architecture" section at the top of this file for the current mechanism.
+Highlights not covered there:
+
+- **Why `MemoryAttention` needed forking, not reuse.** The released cross-attention
+  (`mme_vla_suite.models.integration.history_gemma.MemoryAttention`) has no hook for
+  adding a per-stream score bias -- that requires touching the score computation itself.
+  `FusedMemoryAttention` in `joint_gated_modulator.py` duplicates its math exactly (same
+  hardcoded width/heads, same RoPE convention) with that one addition, following the same
+  "fork only when something is genuinely new" judgment this project already used for
+  `SymbolicMemoryEncoder`.
+- **The numerosity-dilution concern was verified empirically before committing to the
+  fix, not assumed.** Discussed with the user: a plain softmax over 64 symbolic + 512
+  perceptual tokens, absent a content signal, defaults to assigning roughly equal weight
+  per *token* -- so perceptual's 8x count advantage would claim most of the attention mass
+  by default, independent of relevance. `smoke_test.py`'s CHECK1 confirms this directly at
+  random init (bias terms still at zero): observed `attn_mass_sym_mean=0.4142` at toy
+  shapes (s_sym=8/s_perc=12) vs. the theoretical dilution baseline `0.4000` -- a near-exact
+  match. CHECK3 shows the same pattern at the real 64/512 scale (`0.138` observed vs.
+  `0.111` theoretical). `bias_sym`/`bias_perc` (two learned scalars per layer, zero-init)
+  exist specifically to let training correct for this if it's actually distorting results.
+- **What got removed and why.** The router (`gate_sym`/`gate_perc`) and `balance_loss`
+  (the load-balancing loss against gate collapse) don't apply to a design with no 2-way
+  gate to collapse. `EarlyFusionModulator` sows `attn_mass_sym`/`attn_mass_perc` instead --
+  a read-only record of realized attention mass per stream on a given forward pass, not a
+  trained decision variable the way `gate_sym`/`gate_perc` was. If a new form of collapse
+  shows up empirically once this trains (e.g. `attn_mass_sym` pinned near 0 despite the
+  bias terms being free to move), that would be the point to design a new anti-collapse
+  mechanism suited to this architecture -- not before there's evidence it's needed.
+- **Naming.** Class renamed `JointGatedModulator` -> `EarlyFusionModulator`. The nnx
+  attribute name `"joint_gated_modulator"` (in `history_gemma_dual.py`) was deliberately
+  kept unchanged so `ArmDConfig.get_freeze_filter()`'s `.*joint_gated_modulator.*`
+  exemption regex keeps matching without its own edit, even though the mechanism
+  underneath changed completely.
+
+**Verified:** all 4 `smoke_test.py` checks pass (CHECK1 isolated math, CHECK2 scanned
+stack, CHECK3 full `ArmDModel` end-to-end including the `mutable=["intermediates"]`
+extraction now reading `attn_mass_sym`/`attn_mass_perc`, CHECK4 gradient flow) -- on the
+first real run, unlike the `balance_loss` wiring above which took several failed attempts.
+
+**Not yet done:** retraining (the existing step-9999 checkpoint is for a completely
+different mechanism and isn't warm-startable onto this without new work); deciding how (or
+whether) to warm-start `mem_attn_fused`/`mlp_fused` from the released single-stream
+checkpoint at all; updating `analysis/measure_gate_arbitration.py` to read
+`attn_mass_sym`/`attn_mass_perc` instead of the now-removed `gate_sym`/`gate_perc` (done,
+2026-08-29 16:04 -- see RESEARCH_LOG.md).
+
+**Deliberate decision, with a hard follow-up requirement (2026-08-29 16:20):** `bias_sym`/
+`bias_perc` are left at zero-init rather than analytically pre-corrected for the known
+dilution effect, specifically to observe what training actually does before intervening
+further. But after the next training run, `attn_mass_sym`/`attn_mass_perc` MUST be checked
+for collapse toward perceptual before looking at eval success rates at all (see
+RESEARCH_LOG.md's "Open Questions" list) -- if the same collapse the old gate-based design
+showed reappears here (just via attention mass instead of a router value), that means
+unification + alignment loss + the bias lever were not sufficient, and building further
+mechanisms on top without understanding why would be pointless.
+
 ## Scope of this pass
 
 Architecture only: the model runs a forward pass and produces correctly-shaped actions
@@ -69,16 +223,6 @@ installed locally). Out of scope, left for follow-up passes:
 - The section 4.2 symbolic-stream corruption pipeline (grounding perturbation, stale
   subgoal, referent error) needed to generate training data for the *p*-degradation sweep.
 - A training launch / Modal training script for Arm D.
-- Threading `JointGatedModulator`'s per-layer load-balancing loss through
-  `flax.nnx.bridge`'s mutable-collection passthrough into `ArmDModel.compute_loss`'s
-  returned stats dict. The loss itself is implemented and independently verified via a
-  direct `DualMemoryModule.apply(..., mutable=["intermediates"])` call in the smoke test;
-  wiring it into the nnx-based training loop's loss dict is a small follow-up best done
-  against the actual installed flax version rather than guessed here. **Consequence for
-  training as of this pass:** the load-balancing term never reaches the optimizer, so
-  nothing in the current pilot recipe actively defends against modality collapse --
-  worth watching the gate's `gate_sym`/`gate_perc` sow'd values for drift toward 0/1
-  during the pilot, since there's no aux-loss counterpressure yet.
 
 **Bug found and fixed in this verification pass:** `ArmDModel.compute_loss` returned a
 bare loss array instead of the `(loss, stats)` 2-tuple every other branch of the base

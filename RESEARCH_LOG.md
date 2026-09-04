@@ -25,15 +25,452 @@ Single table of the key numbers, updated as they come in. This is the table you'
 | 2026-08-23 19:03 | Arm D pilot batch_size OOM sweep on A10G (24GB) | ArmDModel dual-stream, run_tentative attempts | Post-rematerialization memory floor | bs16: ~18.75GiB (+5.39GiB req, OOM) / bs8: ~17.11GiB (+4.31GiB req, OOM) / bs4: fit | Halving 16->8 only dropped the floor ~1.6GiB -- most of the footprint is batch-independent (frozen 2.3B backbone + Arm D's doubled per-layer memory cross-attention), not batch-scaled activations. | 2026-08-23 code-review entry |
 | 2026-08-24 12:23 | Arm D pilot training, full run | ArmDModel, A10G, batch_size=4, 4-task Counting suite, LoRA VLM, seed 42, 10,000 steps | Final loss (step 9999) | 0.0014 | Completed in one shot, 2h30m wall-clock, well under the 6h Modal timeout. Checkpointed at steps 2000/4000/6000/8000/9999, published to HF Hub as Nkoni/arm-d-counting-suite-pilot/9999.zip for cross-account eval. | 2026-08-24 12:49 entry |
 | 2026-08-25 13:20 | Arm D pilot eval, COMPLETE (600/600) | ArmDPolicy (eval.arm_d_policy), noor-koni2002 account, T4, 3 seeds (0/42/7) x 4 tasks x 50 episodes/task -- full protocol, matches paper/full_eval.py's density exactly | Overall success rate | 600/600 done (100%), 58.17% overall | Final, complete result -- n=150/task, same statistical power as the paper's own numbers on these 4 tasks. Per-task: BinFill 37.3% (n=150) vs. paper's FrameSamp+Modul 39.56%/GroundSG+QwenVL 77.56%; PickXtimes 74.7% (n=150) vs. 87.33%/95.33%; SwingXtimes 83.3% (n=150) vs. 92.00%/5.11%; StopCube 37.3% (n=150) vs. 42.00%/0.44%. Arm D's overall avg (58.17%) sits between the paper's two single-stream baselines (65.22% perceptual avg, 44.61% symbolic avg) on this 4-task subset, closer to the perceptual side on every task -- consistent with the gate leaning perceptual where perceptual already wins big (SwingXtimes, StopCube), but not beating either baseline outright on any task. Batch ran across 3 resume cycles (paused/resumed at 157/600, 366/600, 478/600, each verified clean via show_results with no reset/duplication) then finished and exited on its own once the job list was exhausted -- no final stop needed. Full per-episode detail (all 600 rows: seed/task/episode_idx/outcome/steps) in arm_d_dynamic_fusion/eval/pilot_eval_episodes.csv. Standing caveat still applies (see README's "Fairness caveat"): Arm D got Counting-suite-specific fine-tuning neither baseline received, so this compares a fine-tuned+gated model against un-fine-tuned baselines, not the gate mechanism in isolation. | 2026-08-24/25 eval-progress-check entries |
+| 2026-08-28 21:24 | Arm D pre-fusion representation-alignment diagnostic | random_init vs. trained_pilot_9999 (step 9999), nour-mkawni account, A10G, 256 real pilot-training examples (8 batches x 32) | Retrieval accuracy, sym-to-perc (vs. chance) | random_init 2.73% / trained 3.12% (chance=3.12%) | Matched-vs-unmatched cosine similarity statistically indistinguishable in both conditions -- zero example-level correspondence signal between M_sym/M_perc, before or after training. RMS-norm ratio (sym/perc) also worsened with training: 0.113 -> 0.069. | 2026-08-28 21:24 entry |
+| 2026-08-28 22:14 | Arm D gate-arbitration check (real data, trained_pilot_9999) | 18 action-expert layers, 256 real pilot-training examples (8 batches x 32) | gate_sym / gate_perc, mean±std, all layers pooled | gate_sym=0.0000105±0.0000348 / gate_perc=1.0±0.0 | Full modality collapse to perceptual, uniform across all 18 layers and all 256 examples (std=0.0 on gate_perc -- not content-dependent at all). Directly explains why eval leaned perceptual on every task, including BinFill where symbolic actually wins big in the paper's own numbers. | 2026-08-28 22:14 entry |
+| 2026-08-29 15:53 | Arm D early-fusion redesign, numerosity-dilution check | EarlyFusionModulator, random init, toy shapes s_sym=8/s_perc=12 (CHECK1) and real 64/512 (CHECK3, constant-filled synthetic data) | attn_mass_sym_mean (bias terms at zero-init, no correction) | toy: 0.4142 (theoretical 0.4000) / real: 0.138 (theoretical 0.111) | Confirms empirically, not just theoretically, that a plain single softmax over imbalanced token counts defaults to roughly-equal weight per token -- i.e. perceptual's 8x token-count advantage claims most attention mass by default, independent of content. Motivates the learned bias_sym/bias_perc terms added specifically to counter this. | 2026-08-29 15:53 entry |
+| 2026-09-02 00:39 | Arm D v1 per-task attn_mass_sym diagnostic, COMPLETE | Nkoni/arm-d-v1 (step 9999), nour-mkawni account, A10G, 640 real pilot-training examples per task (20 batches x 32, targeted per-task index windows, 0 mismatch/0 unclassified in all 4) | attn_mass_sym mean±std per task | BinFill 0.4401±0.0580 / StopCube 0.4180±0.0672 / SwingXtimes 0.4094±0.0618 / PickXtimes 0.3850±0.0507 (all n=640) | BinFill sits above both SwingXtimes (+0.031) and StopCube (+0.022) as the working hypothesis predicts, and the gaps are too large relative to std/sqrt(n) to be sampling noise (~6-9 SEs) -- but the full 4-task spread is only 0.055 (0.385-0.440), a small effect, not the large task-dependent split that would indicate strong arbitration. Getting a trustworthy number took 2 failed attempts first (see full trail in the 2026-09-01 22:xx-2026-09-02 00:xx entries below): the original script classified on the wrong field (simple_subgoal, shared vocabulary across tasks -- SwingXtimes's real instructions never contain the literal word "swing" so its keyword rule could never match anything) and scanned sequentially from index 0 in a dataset laid out in one contiguous block per task, so it could never reach SwingXtimes (last ~22% of the dataset) at any scan size tried. Full write-up: arm_d_dynamic_fusion/analysis/attn_mass_per_task_findings.md. | 2026-09-01 22:30-2026-09-02 00:39 entries |
+| 2026-09-02 14:11 | Arm D v1 representation-alignment diagnostic, COMPLETE (re-run against NEW checkpoint) | random_init vs. trained_arm_d_v1 (Nkoni/arm-d-v1, step 9999), nour-mkawni account, A10G, 256 real pilot-training examples (8 batches x 32) | Retrieval accuracy, sym-to-perc / perc-to-sym (vs. chance) | random_init 2.73%/3.12% (=chance) / trained_arm_d_v1 27.34%/27.73% (~9x chance) | Large, unambiguous result, and the OPPOSITE of the OLD design's outcome (2026-08-28 21:24 entry: OLD checkpoint scored 2.73%/3.12%, i.e. at chance, zero alignment signal). The new early-fusion checkpoint shows real cross-modal alignment as a side effect of ordinary training with no explicit alignment loss: matched-pair cosine similarity 0.9078 vs. unmatched-pair 0.0911 (random_init: 0.0246 both, i.e. no separation at all pre-training); centroid cosine similarity 0.0272->0.7111. Side note worth flagging: symbolic/perceptual RMS-norm ratio moved from 1.00 (random_init, balanced) to 6.03 after training -- a new magnitude imbalance (symbolic now ~6x larger), in the OPPOSITE direction from the OLD design's imbalance (0.113->0.069, perceptual larger). Not yet confirmed as connected, but a plausible contributing factor to the same-day attn_mass_per_task diagnostic's small BinFill-leans-symbolic signal (both diagnostics run same week, same checkpoint). Checkpoint pointer repointed from Nkoni/arm-d-counting-suite-pilot (OLD) to Nkoni/arm-d-v1 first (same one-constant change upload_checkpoint.py got 2026-08-31) -- local cache dirname also had to change, not just the HF repo pointer, to avoid silently reusing an already-cached OLD-checkpoint zip under the same folder name. Full write-up: arm_d_dynamic_fusion/analysis/representation_alignment_findings.md. | 2026-09-02 14:11 entry |
+| 2026-09-02 15:30 | Arm D v1 magnitude-vs-attention correlation diagnostic, COMPLETE | Nkoni/arm-d-v1 (step 9999), nour-mkawni account, A10G, 2560 real pilot-training examples (640/task, same 4 windows as the attn_mass_per_task diagnostic) | Pearson r (attn_mass_sym vs. per-example sym/perc RMS-norm ratio) | Pooled: -0.035 (Spearman rho=0.055, n=2560). Per-task: BinFill -0.074 / PickXtimes -0.326 / StopCube +0.393 / SwingXtimes -0.248 (all n=640) | Clean NEGATIVE result -- tests the specific worry raised by the 14:11 entry's magnitude-imbalance side-finding. If the 6x symbolic/perceptual magnitude imbalance were driving the small BinFill-leans-symbolic signal (00:39 entry) via ordinary dot-product attention math, examples with a bigger per-example magnitude ratio should reliably get more symbolic attention -- they don't (pooled r~=0, ratio quintile means bounce 0.395-0.435 with no monotonic trend across the full 3.94-8.95 ratio range, per-task correlations don't even agree on sign). Rules out the specific, easily-fixable explanation (normalize K vectors before the dot product); the small task-dependent signal from the per-task diagnostic more likely reflects some real (if weak) learned content-based differentiation, not a raw-magnitude artifact -- though this diagnostic doesn't identify what IS driving it. Full write-up: arm_d_dynamic_fusion/analysis/magnitude_attn_correlation_findings.md. | 2026-09-02 15:30 entry |
+| 2026-09-02 16:01 | Arm D v1 modality-tag health diagnostic, COMPLETE (cheap, no GPU/forward pass) | Nkoni/arm-d-v1 (step 9999), nour-mkawni account, CPU-only, params-only read (no data, no forward pass) | tag_sym/tag_perc norm vs. expected init norm (~0.64), cosine(tag_sym,tag_perc) per layer (18 layers) | All 18 layers' norms cluster 0.62-0.67 (essentially = init norm 0.64, no growth). Mean cosine similarity -0.0052 (range -0.05 to +0.05) | Tags look essentially UNTRAINED, not "collapsed" or "healthy" -- norms show no meaningful growth from small-random init at all, and the near-zero cosine similarity is exactly what independent random Gaussian vectors in 1024-D would already show BEFORE training (expected ~+-1/sqrt(1024)~=+-0.03), so it's not evidence training pushed the tags apart, just that training barely moved them. A third outcome distinct from the two originally being checked for (real distinct markers vs. collapsed-together); plausible contributor to the broader pattern this week of real-but-modest fusion-mechanism signals rather than strong ones. Full write-up: arm_d_dynamic_fusion/analysis/tag_health_findings.md. | 2026-09-02 16:01 entry |
+| 2026-09-02 16:37 | Arm D v1 modality-tag health, ACROSS TRAINING (follow-up, free/cheap) | Nkoni/arm-d-v1 run, steps 2000/4000/6000/8000/9999, nour-mkawni account, CPU-only, params-only reads off the private training volume | mean ||tag_sym||/||tag_perc||/cos(sym,perc) per checkpoint step | 2000: 0.6414/0.6389/-0.0062. 4000: 0.6416/0.6390/-0.0056. 6000: 0.6417/0.6392/-0.0056. 8000: 0.6418/0.6393/-0.0048. 9999: 0.6419/0.6394/-0.0052 | DEFINITIVE answer to "moved and drifted back vs. never moved": never moved. Per-layer values are virtually identical from step 2000 (only 20% into the 10k-step run) through step 9999 -- e.g. layer 8's tag_sym norm reads 0.6337 at step 2000 vs. 0.6340 at step 9999, a 4th-decimal-place difference after 8000 more training steps, and every layer/every step shows this same flat pattern. Stronger and more specific than the 16:01 entry's "essentially untrained" -- whatever these params were doing (or not) was already fully decided by step 2000 and never changed again, meaning they likely received negligible gradient signal from very early in (or the entirety of) training, not merely "not enough steps yet." Not yet checked: actual gradients during training, or whether these params are somehow excluded/zeroed in the optimizer setup. Updated write-up: arm_d_dynamic_fusion/analysis/tag_health_findings.md (follow-up section). | 2026-09-02 16:37 entry |
+| 2026-09-02 16:56 | Arm D v1 gradient-magnitude check, single real backward pass | Nkoni/arm-d-v1 (step 9999), nour-mkawni account, A10G, 1 batch (n=4, matches real training batch_size), no optimizer update | RMS gradient vs. mem_attn_fused q/kv projection baseline (RMS~=1.07e-5) | tag_sym 3.67e-6 (0.34x baseline) / tag_perc 9.82e-6 (0.91x, ~=baseline) / bias_sym 9.44e-5 (8.8x baseline) / bias_perc 9.44e-5 (8.8x baseline) | RULES OUT the "loss doesn't care, gradient near-zero" explanation for the 16:37 entry's flat-across-training finding -- none of the 4 params show a near-zero gradient; 3 of 4 are comparable to or LARGER than a normal, actively-training param on this single batch. Real per-step gradient + zero net movement over 8000 steps is a genuine puzzle pointing at a third possibility (direction inconsistency across batches/tasks), tested next. Not yet in a findings.md at this point (see 17:04 entry below, which folds this in). | 2026-09-02 16:56 entry |
+| 2026-09-02 17:04 | Arm D v1 gradient-DIRECTION consistency across tasks, single backward pass per task | Nkoni/arm-d-v1 (step 9999), nour-mkawni account, A10G, 4 batches (1/task, n=4 each), no optimizer update | bias sign agreement across 4 tasks (per layer); tag_sym/tag_perc pairwise cross-task cosine similarity (mean across 18 layers) | bias_sym/bias_perc: only 2/18 layers where all 4 tasks agree on sign (chance level ~12.5% for 4 independent signs -- essentially no relationship). tag_sym/tag_perc: all 6 task-pair mean cosines between 0.06 and 0.40 (well below the ~1.0 a shared direction would show), every pair's per-layer range spans clearly negative to clearly positive (e.g. BinFill vs. StopCube: -0.56 to +0.62) | CONFIRMS the direction-inconsistency hypothesis the 16:56 entry raised. These 4 params receive real, comparable-or-larger-than-normal gradients on every step, but different Counting-suite tasks push them in inconsistent, often directly conflicting directions -- averaged across a training run mixing all 4 tasks, those pushes largely cancel, exactly matching the flat-across-checkpoints finding (16:37 entry) despite real per-step signal. BinFill is consistently the most "out of step" task (lowest cosine similarity vs. all 3 others), loosely consistent with it being the one task hypothesized to need symbolic content differently. Practical implication: a higher LR for these params alone is unlikely to help (would amplify the conflicting tug-of-war, not resolve it) -- matches the user's own tempered expectation, but for a more specific reason (direction conflict across tasks, not gradient magnitude). Full write-up (covers both this and the 16:56 entry): arm_d_dynamic_fusion/analysis/grad_health_findings.md. | 2026-09-02 16:56-17:04 entries |
 
 ---
 
 ## Open Questions / Ideas To Try
 - ~~Whether the debian_slim-vs-nvidia/cuda base image distinction also matters for the JAX/pi0.5 policy-serving image~~ — moot, JAX/CUDA compute loaded fine regardless (see 2026-07-27 policy entry); the distinction only mattered for graphics/Vulkan rendering.
+- **Hard stop before declaring the early-fusion redesign a success:** after the next Arm D training run, check `attn_mass_sym`/`attn_mass_perc` (via `measure_gate_arbitration.py`, updated 2026-08-29) for collapse toward perceptual BEFORE looking at eval success rates. `bias_sym`/`bias_perc` were deliberately left at zero-init (2026-08-29 16:20 decision, user's explicit call) so training's actual behavior can be observed rather than assumed -- but if `attn_mass_perc` ends up pinned near 1.0 again (the same failure as the OLD gate-based design, just via attention mass instead of a router value), that means unification + alignment loss + the bias lever were NOT sufficient to fix the underlying collapse tendency, and adding further mechanisms on top without first understanding why would be pointless. If that happens: investigate the actual gradient dynamics (is perceptual still getting a bigger gradient signal for some other reason even after RMSNorm/alignment fixed the raw-magnitude imbalance?) before reaching for another architectural patch, and revisit the zero-init decision above (an analytically-set neutral starting bias was the alternative considered and deliberately deferred, not ruled out).
 
 ---
 
 ## Log
+
+### 2026-09-02 16:56-17:04 — Arm D v1 gradient health: real per-step gradients, but conflicting across tasks -- solves the "why never moved" puzzle
+**Tags:** #diagnostic
+
+**Goal:** User request, direct follow-up to the 16:37 entry below (tags flat across every checkpoint from step 2000 to 9999). Before touching any training hyperparameters (e.g. a separate higher LR for tag_sym/tag_perc/bias_sym/bias_perc), check WHY these params never moved: is the gradient genuinely near-zero (loss doesn't care -- higher LR won't help, AdamW already adapts per-parameter step size to a param's own gradient history), or is it real but inconsistent across training examples (higher LR would just amplify noise, not fix anything)? Full write-up (both parts): `arm_d_dynamic_fusion/analysis/grad_health_findings.md`.
+
+**Part 1 (16:56, `inspect_grad_health.py`, new script) -- single real backward pass, one batch (n=4, matches real training batch_size), no optimizer update, mirrors `scripts/train.py`'s `train_step` exactly (same `nnx.value_and_grad`/`trainable_filter`/loss_fn, just no `optimizer.update()`).** Compared RMS gradient (the fair per-element comparison, since these params range from 1 scalar/layer to ~1M elements/layer) against `mem_attn_fused`'s q/kv projection weights as a "normal, actively-training" baseline (RMS≈1.07e-5):
+
+| Param | RMS grad | vs. baseline |
+|---|---|---|
+| tag_sym | 3.67e-06 | 0.34x |
+| tag_perc | 9.82e-06 | 0.91x (~= baseline) |
+| bias_sym | 9.44e-05 | 8.8x baseline |
+| bias_perc | 9.44e-05 | 8.8x baseline |
+
+**Result: rules out "near-zero gradient."** None of the 4 params show a tiny instantaneous signal -- 3 of 4 are comparable to or bigger than a normal param on this batch. This directly contradicts the naive reading of the 16:37 entry's flat-values finding, and raised a genuine puzzle: real per-step gradient + zero net displacement over 8000 steps points at gradient DIRECTION being inconsistent across different batches/tasks (conflicting pulls cancelling out), a third possibility the original framing didn't cover.
+
+**Part 2 (17:04, `inspect_grad_sign_consistency.py`, new script) -- tested the direction-inconsistency hypothesis directly.** Same single-backward-pass mechanism, run once per Counting-suite task (BinFill@10000, PickXtimes@80000, StopCube@125000, SwingXtimes@160000 -- same known-pure windows `measure_attn_mass_per_task.py` established), one subprocess per task (established OOM-avoidance pattern). For `bias_sym`/`bias_perc` (scalar/layer), compared sign agreement across all 4 tasks per layer. For `tag_sym`/`tag_perc` (1024-dim vector/layer), compared pairwise cross-task cosine similarity per layer (direction, not just sign):
+
+- **bias_sym/bias_perc:** only 2/18 layers where ALL 4 tasks agree on sign -- chance level for 4 independent signs is ~12.5% (1/8), so 2/18 (11%) is indistinguishable from tasks pulling the sign essentially at random relative to each other.
+- **tag_sym/tag_perc:** all 6 task-pair mean cosine similarities (18-layer average) fall between 0.06 and 0.40 -- nowhere close to the ~1.0 a shared, reinforcing direction would show. Every pair's per-layer range spans clearly negative to clearly positive (e.g. BinFill vs. StopCube tag_sym: -0.56 to +0.62), meaning even within one task pair, some layers see the two tasks' gradients agree strongly and others see them directly oppose. BinFill is consistently the most "out of step" task (lowest cosine similarity against all 3 others in both tag_sym and tag_perc) -- loosely consistent with BinFill being the one task hypothesized to need symbolic content most differently from the rest.
+
+**Reading: CONFIRMS the direction-inconsistency hypothesis, resolving the puzzle.** These 4 params receive real, non-trivial, comparable-or-larger-than-normal gradients on every single training step -- they are not being ignored by the loss. But different Counting-suite tasks push them in inconsistent, often directly conflicting directions. Averaged across a training run that mixes all 4 tasks together, those conflicting pushes largely cancel out over thousands of steps -- exactly consistent with the params sitting essentially frozen at their random-init position despite 8000 real training steps (16:37 entry). **Practical implication for the LR idea (the actual decision this was checking before spending any GPU-hours on it):** a higher learning rate specifically for these params is unlikely to help on its own, and could make things noisier rather than better -- it would amplify each step's push-and-pull without resolving the underlying cross-task conflict. This matches the user's own tempered expectation about the LR experiment, but via a more specific mechanism (direction conflict across tasks) than the originally-considered "gradient too small, drowned out by bigger params" framing -- a fix would need to address the conflict itself (e.g. task-aware training) rather than just a bigger step size on the same noisy tug-of-war. `bias_sym`/`bias_perc` gradients were confirmed near-exact negatives of each other within each task, as expected structurally (`attn_mass_sym`/`attn_mass_perc` sum to 1) -- an internal-consistency check that the diagnostic is measuring the right thing, not a new finding.
+
+---
+
+### 2026-09-02 16:37 — Arm D v1 modality-tag health, across training -- DEFINITIVE: tags never moved at all, not "moved then drifted back"
+**Tags:** #diagnostic
+
+**Goal:** User follow-up on the 16:01 entry below -- that entry only checked the FINAL checkpoint (step 9999) and found tag_sym/tag_perc sitting at essentially their random-init norm/direction, but couldn't tell apart two very different explanations: the tags moved during training and drifted back toward init by the end, vs. the tags never moved at all. Since every intermediate checkpoint (2000/4000/6000/8000) was already saved during training and sitting on the private training volume, checking this costs nothing extra -- same cheap CPU-only params read, just pointed at 5 checkpoints instead of 1. Updated write-up: `arm_d_dynamic_fusion/analysis/tag_health_findings.md` (new follow-up section, original section left intact above it).
+
+**Script change:** extended `inspect_tag_health.py` (same file, in place) to source ALL 5 checkpoints from the private training volume directly (`robomme-arm-d-pilot-training`, path `ckpts/arm_d_pilot/counting-suite-early-fusion-no-warmstart/{step}` -- same convention `inspect_bias_lever.py` already uses) rather than the published HF Hub repo, since steps 2000/4000/6000/8000 were never published there -- only step 9999 was (`upload_checkpoint.py`, 2026-08-31). Confirmed training happened on `nour-mkawni` (2026-08-30 21:xx entry, `fc-01M19286K82A2B8ERWA9VZDPX0` under app `ap-OtPMiQkMi5mdb6pjggCjoA`), same account as all 4 of this week's diagnostics, so no cross-account complication.
+
+**Run (`ap-RYk88Ebtob9b11dFpHmZNl`), SUCCESS, first try, fast (5x cheap CPU-only params reads, no GPU):**
+
+| Step | mean ‖tag_sym‖ | mean ‖tag_perc‖ | mean cos(sym,perc) |
+|---|---|---|---|
+| 2000 | 0.6414 | 0.6389 | -0.0062 |
+| 4000 | 0.6416 | 0.6390 | -0.0056 |
+| 6000 | 0.6417 | 0.6392 | -0.0056 |
+| 8000 | 0.6418 | 0.6393 | -0.0048 |
+| 9999 | 0.6419 | 0.6394 | -0.0052 |
+
+**Reading: definitive answer, and a stronger finding than the 16:01 entry's hedged "essentially untrained."** These aren't just similar across checkpoints -- they're virtually flat. Per-layer detail confirms it at full resolution: layer 8's `tag_sym` norm reads 0.6337 at step 2000 (only 20% through the 10k-step run) and 0.6340 at step 9999 -- a 4th-decimal-place difference after 8000 MORE training steps. Every one of the 18 layers, at every one of the 5 checkpoints, shows this same flat-line pattern (full per-layer tables for all 5 steps in the run log). This rules out "moved and drifted back" -- there's no drift to speak of, in either direction, at any point. Whatever these params were going to do (or not do) was already fully decided by step 2000 and never changed again over the remaining 8000 steps. This points specifically at "these parameters are receiving negligible gradient signal, essentially from the very start of training" rather than the softer "training didn't move them much." One specific candidate explanation was checked and RULED OUT immediately: `arm_d_pi0.py`'s `get_freeze_filter()` override (`gate_exempt = nnx_utils.PathRegex(r".*joint_gated_modulator.*")`, combined as `nnx.All(base_frozen, nnx.Not(gate_exempt))`) explicitly EXEMPTS (keeps trainable) anything under the `joint_gated_modulator` path prefix -- tag_sym/tag_perc live under exactly that prefix, so this filter is not accidentally freezing them; they should be receiving gradients per this filter's logic. Still not yet checked: actual per-step gradient magnitudes on these specific params during training (would need either a live training run or a from-checkpoint backward pass, neither done here), or whether the optimizer applies some other per-param scaling (e.g. weight decay group, LR multiplier) that happens to suppress them specifically.
+
+---
+
+### 2026-09-02 16:01 — Arm D v1 modality-tag health diagnostic, COMPLETE -- tags look essentially untrained, not collapsed or healthy
+**Tags:** #diagnostic
+
+**Goal:** User request -- cheap, CPU-only, params-only check (modeled directly on `inspect_bias_lever.py`'s pattern) of `tag_sym`/`tag_perc`, EarlyFusionModulator's learned per-layer modality-identity vectors added to each memory stream before fusion. Report each tag's norm (grew meaningfully from small-random init, or stayed tiny?) and cosine similarity between tag_sym/tag_perc per layer. User's framing: low cosine similarity + non-trivial norm = real distinct identity markers; high cosine similarity (near 1) or near-zero norm = not doing meaningful work. Full plain-language write-up: `arm_d_dynamic_fusion/analysis/tag_health_findings.md`.
+
+**New script:** `arm_d_dynamic_fusion/analysis/inspect_tag_health.py`. Found the correct param key paths by reading `joint_gated_modulator.py` directly: `tag_sym`/`tag_perc` are declared via `self.param(...)` directly inside `EarlyFusionModulator.__call__` (not inside the nested `FusedMemoryAttention(name="mem_attn_fused")` submodule where `bias_sym`/`bias_perc` live) -- confirmed `EarlyFusionModulator(name="joint_gated_modulator")` is the instantiation name (`history_gemma_dual.py` line 97), so the flattened keys are `PaliGemma/llm/layers/joint_gated_modulator/tag_sym` and `.../tag_perc` (siblings of `mem_attn_fused/`, not nested under it). Both tags: `normal(stddev=0.02)` init over width=1024, giving an expected init norm of `0.02*sqrt(1024)~=0.64`. Restores checkpoint params via `restore_type=np.ndarray` (no JAX device/GPU needed), same as `inspect_bias_lever.py` -- but pointed at the PUBLISHED `Nkoni/arm-d-v1` step-9999 checkpoint on HF Hub (matching the other 3 diagnostics this week), not a private training-volume checkpoint like `inspect_bias_lever.py`'s original target.
+
+**Run (`ap-IwVExoSIiUfpTLEjyYI6Se`), SUCCESS, first try, fast (no GPU, checkpoint already cached from earlier runs today):**
+
+| Layer | ‖tag_sym‖ | ‖tag_perc‖ | cos(sym,perc) |
+|---|---|---|---|
+| 0-17 (all) | 0.62-0.66 | 0.61-0.67 | -0.05 to +0.05 |
+| Expected init norm | ~0.64 | ~0.64 | -- |
+| Mean cos across layers | -- | -- | -0.0052 |
+
+**Reading:** neither of the two clean outcomes checked for -- a third case worth flagging on its own. Norms show essentially NO growth from the theoretical random-init value across any of the 18 layers (tight 0.62-0.67 cluster right on top of 0.64) -- whatever gradient these params received over ~10k steps wasn't enough to move them meaningfully. The near-zero cosine similarity, read naively, looks like the "good" outcome (low similarity = distinct markers) -- but two independent random Gaussian vectors in 1024 dimensions are ALREADY nearly orthogonal purely by chance before any training (expected cosine ~+-1/sqrt(1024)~=+-0.03, matching the observed range almost exactly) -- so this isn't evidence training pushed the tags apart, it's consistent with training having barely touched them, leaving them wherever they started. **Conclusion: the modality tags look essentially untrained**, not actively collapsed (bad) and not actively healthy/distinct-by-training (good) -- they're sitting close to where random initialization put them. Plausible (unconfirmed) contributors: a learning-rate/gradient-scale mismatch specific to these small params, or the memory tokens' own content (M_sym vs. M_perc are very different by construction) already carrying enough stream-identity signal that the explicit tags matter less than the design assumed. Fits the broader pattern from the other 3 diagnostics this week (00:39, 14:11, 15:30 entries below): real-but-modest signals throughout, not strong/decisive ones in either direction -- a model whose fusion mechanism clearly isn't collapsed like the OLD design, but hasn't fully "come alive" either. Only the final checkpoint (step 9999) was checked; intermediate checkpoints (2000/4000/6000/8000, also saved per the training log) aren't yet checked and could show whether the tags moved and drifted back, or never moved at all.
+
+---
+
+### 2026-09-02 15:30 — Arm D v1 magnitude-vs-attention correlation diagnostic, COMPLETE -- clean negative result, rules out the magnitude-artifact explanation
+**Tags:** #diagnostic
+
+**Goal:** User request -- direct follow-up to two same-day findings above (14:11 representation-alignment entry: symbolic tokens are now ~6x larger in RMS-norm than perceptual, a NEW post-training imbalance; 00:39 attn_mass_per_task entry: BinFill's attn_mass_sym sits a small-but-real amount above SwingXtimes/StopCube's). The concern: standard dot-product attention scores scale with key-vector magnitude, so the small BinFill-leans-symbolic signal might just be "symbolic vectors happen to be bigger," not learned task-dependent relevance -- a magnitude artifact, not real arbitration. If true, that's a concrete, easily-fixable thing (normalize K vectors before the dot product); if false, the weak-arbitration finding needs a different explanation. Full plain-language write-up: `arm_d_dynamic_fusion/analysis/magnitude_attn_correlation_findings.md`.
+
+**New script:** `arm_d_dynamic_fusion/analysis/measure_magnitude_attn_correlation.py`, built on `measure_attn_mass_per_task.py`'s forward-pass/subprocess-per-task pattern (reusing its same 4 proven-pure task windows: BinFill@10000, PickXtimes@80000, StopCube@125000, SwingXtimes@160000, 20 batches/640 examples each) plus `measure_representation_alignment.py`'s per-example RMS-norm computation (kept per-example rather than aggregated across the batch, specifically so it can be paired with that same example's `attn_mass_sym`). For each of 2560 real examples, records BOTH numbers for the SAME example, then computes Pearson r and Spearman rho (pooled and per-task) plus a ratio-quintile bucket table.
+
+**Run (`ap-paMjYEeC53rLdgq0TKxv9b`), SUCCESS, first try (after one syntax-error fix caught by `py_compile` before dispatch -- a stray leftover `'''` from copy-pasting the triple-quoted-string pattern):**
+
+| Task | Pearson r | n |
+|---|---|---|
+| BinFill | -0.074 | 640 |
+| PickXtimes | -0.326 | 640 |
+| StopCube | +0.393 | 640 |
+| SwingXtimes | -0.248 | 640 |
+| **Pooled** | **-0.035** (Spearman rho=0.055) | 2560 |
+
+Ratio quintile table (pooled, sorted by per-example sym/perc RMS-norm ratio, range 3.94-8.95): Q1=0.4053, Q2=0.4345, Q3=0.3949, Q4=0.4192, Q5=0.4119 mean attn_mass_sym -- no monotonic trend, bounces within a ~0.04 band across the full ratio range.
+
+**Reading:** a clean negative result. If magnitude were a real driver, the pooled correlation (widest ratio range, most statistical power) is exactly where it should show up most clearly, and it doesn't (r=-0.035, essentially zero). The quintile table confirms this visually -- Q5 (largest ratios) isn't meaningfully higher than Q1 (smallest), and Q3 is actually the lowest of all five. Per-task correlations don't even agree on sign (StopCube +0.393 vs. the other three negative), which is itself evidence against a consistent magnitude-driven mechanism -- a real causal effect should point the same direction across tasks. **Rules out the specific, easily-fixable explanation** (K-vector normalization) for the 00:39 entry's small BinFill signal -- that signal more likely reflects some real, if weak, learned content-based differentiation rather than a raw-magnitude artifact, though this diagnostic doesn't identify what IS actually driving it. The 6x magnitude imbalance from the 14:11 entry remains a real, confirmed fact about this checkpoint -- just not, per this test, a meaningful driver of the specific per-example attention split measured here.
+
+---
+
+### 2026-09-02 14:11 — Arm D v1 representation-alignment diagnostic, COMPLETE -- large positive result, opposite of the OLD checkpoint
+**Tags:** #diagnostic
+
+**Goal:** User request -- re-run the representation-alignment diagnostic (last run 2026-08-28 against the OLD design's checkpoint) against the NEW early-fusion `Nkoni/arm-d-v1` checkpoint, and compare against the OLD checkpoint's chance-level numbers (2.73%/3.12%). Full plain-language write-up: `arm_d_dynamic_fusion/analysis/representation_alignment_findings.md`.
+
+**Prerequisite fix (before running):** `measure_representation_alignment.py` was still pointed at `Nkoni/arm-d-counting-suite-pilot` (the OLD checkpoint). Repointed `HF_CKPT_REPO` to `Nkoni/arm-d-v1` -- same one-constant change `upload_checkpoint.py` got 2026-08-31. Also had to rename the local checkpoint-cache subdirectory (`arm-d-counting-suite-pilot` -> `arm-d-v1`), not just the HF repo pointer: this diagnostic shares its checkpoint-cache Modal Volume with `run_pilot_eval.py`/`measure_attn_mass_per_task.py`, and the OLD checkpoint's zip was very likely already cached under the old subdirectory name from the 2026-08-28 run -- leaving the local dirname unchanged while only swapping `HF_CKPT_REPO` would have made `download_checkpoint()` see that old zip already present and silently skip downloading the new one, evaluating the wrong checkpoint under the "arm-d-v1" label. Also renamed the `"trained_pilot_9999"` condition label to `"trained_arm_d_v1"` throughout, since the OLD checkpoint's own 2026-08-28 diagnostic used that same label for a different checkpoint -- keeping it would make the two runs' results ambiguous to tell apart later.
+
+**Run (`ap-T73GhkUPz3lmZx5c39Chcc`), SUCCESS, first try:** 256 real pilot-training examples (8 batches x 32), `random_init` vs. `trained_arm_d_v1`, each condition its own subprocess (established OOM-avoidance pattern, unchanged from the script's original design).
+
+| Metric | random_init | trained_arm_d_v1 | OLD checkpoint (2026-08-28) |
+|---|---|---|---|
+| sym->perc retrieval acc | 2.73% | 27.34% | 2.73% |
+| perc->sym retrieval acc | 3.12% | 27.73% | 3.12% |
+| chance level | 3.12% | 3.12% | 3.12% |
+| matched-pair cosine sim | 0.0246 | 0.9078 | -- |
+| unmatched-pair cosine sim | 0.0246 | 0.0911 | -- |
+| centroid cosine sim | 0.0272 | 0.7111 | -- |
+| sym/perc RMS-norm ratio | 1.0011 | 6.0295 | 0.069 (worsened from 0.113 pre-training) |
+
+**Reading:** a large, unambiguous, and genuinely different result from the OLD design. The OLD checkpoint showed zero alignment signal (matched vs. unmatched pairs statistically indistinguishable, retrieval at chance) even after ~10k training steps. This NEW early-fusion checkpoint shows real cross-modal alignment as a side effect of ordinary downstream-loss training, with no explicit alignment objective: retrieval accuracy ~9x chance, matched pairs averaging 0.91 cosine similarity vs. 0.09 for mismatched pairs, and even the batch centroids (average symbolic vector vs. average perceptual vector) aligned at 0.71 cosine similarity. This is evidence the early-fusion redesign's architecture change (not just more training) is what produced the alignment -- the OLD design had comparable training (10k steps) and got nothing.
+
+**Side finding worth tracking:** sym/perc RMS-norm ratio moved from 1.00 (random_init, balanced) to 6.03 after training -- symbolic vectors are now ~6x larger in magnitude than perceptual vectors post-training, a NEW imbalance in the opposite direction from the OLD design's (which had perceptual growing relatively larger, ratio 0.113->0.069). Not yet confirmed as causally connected, but flagged as a plausible contributing factor to the same-week `attn_mass_per_task` diagnostic's finding (BinFill's small-but-real lean toward symbolic attention, 2026-09-02 00:39 entry below) -- larger key/value magnitude can skew dot-product-based attention scores independent of content. Worth a dedicated check if the unification-mechanism design work (the decision this diagnostic's output feeds, per the user's supervisor's 2026-08-28 direction) moves forward.
+
+---
+
+### 2026-09-02 00:39 — Arm D v1 per-task attn_mass_sym diagnostic, COMPLETE (after fixing two real bugs)
+**Tags:** #diagnostic
+
+**Goal:** User request -- test Arm D's core hypothesis directly: does the trained model attend more to symbolic memory on BinFill (where the symbolic plan matters more) than on SwingXtimes/StopCube (where perceptual/motion content should matter more)? Full plain-language write-up: `arm_d_dynamic_fusion/analysis/attn_mass_per_task_findings.md`.
+
+**Starting state check (22:30):** RESEARCH_LOG's prior 16:03/13:32 entries claimed this diagnostic was "handed off to a separate Claude session" and already dispatched. Checked directly (`modal container list` on both `nour-mkawni` and `arm-d-eval` accounts) -- nothing was actually running on either account. `modal app list`/`--json` also came back empty even for a confirmed-existing stopped app (`ap-38EWhEtVq3XZ0MabkU0O3b`, verified via `modal app logs` directly), so `app list` is unreliable in this environment -- `container list` is the reliable check going forward for "is anything actually running right now."
+
+**Attempt 1 (22:34, run `ap-m9Jx6wEBUdV4UQow6ndl1J`):** Ran the diagnostic as it already existed (NUM_BATCHES=20, 640 examples, sequential scan from index 0, classifying on `simple_subgoal`). Result: only PickXtimes (n=383) and BinFill (n=127) classified; zero SwingXtimes, zero StopCube; 130 unclassified. Could not test the hypothesis at all.
+
+**Attempt 2 (23:0x, run `ap-...` OOM):** Per user's choice (bump scan size), NUM_BATCHES raised 20->400 (12,800 examples), timeouts raised to accommodate. Crashed with `RESOURCE_EXHAUSTED` (GPU out-of-memory on the A10G) after 63/400 batches -- confirmed a real memory-accumulation issue in the single-process forward-pass loop, not a fluke. Even the ~2016 examples processed before the crash still contained zero SwingXtimes/StopCube.
+
+**Root-cause investigation (23:1x-23:5x):** Wrote a new, cheap, CPU-only, no-GPU/no-model diagnostic (`arm_d_dynamic_fusion/analysis/scan_task_distribution.py`) that reads the raw per-example pickle records directly (bypassing all transform/model machinery) across the FULL 189,035-example dataset (stride-10 sample, ~18,904 records, parallelized 32-way after a first sequential attempt timed out at 1700s). Found two independent real bugs:
+1. The dataset is laid out in one large contiguous block per task, in this order: BinFill [~0,~60k), PickXtimes [~63k,~114k), StopCube [~117k,~147k), SwingXtimes [~147k,189035) -- so any sequential scan starting at index 0 could only ever reach whichever blocks it covered first; reaching SwingXtimes requires scanning ~78% of the whole dataset.
+2. The classifier's keyword rules were built against `simple_subgoal` (the per-timestep instruction, e.g. "pick up the red cube"), but the 4 tasks share most of that step vocabulary (checked directly against each task's real instruction templates in `robomme_policy_learning/examples/robomme/subgoal_prediction/gemini/prompts/{BinFill,PickXtimes,StopCube,SwingXtimes}.py`) -- e.g. "pick up the [color] cube" appears verbatim in BinFill, PickXtimes, AND SwingXtimes's own subgoal vocab. Confirmed the literal word "swing" never appears ANYWHERE in the real per-step or per-episode text for SwingXtimes (or anywhere in the whole dataset) -- the old `("SwingXtimes", ["swing"])` rule could never have matched a single example, at any scan size, ever. Separately confirmed (via a raw-record key dump) that the dataset carries a second, cleaner field -- `prompt`, the full per-episode task instruction (e.g. "put two red cubes into the bin, then press the button to stop") -- that the original script wasn't using at all (it checked `simple_subgoal` first, falling back to `prompt` only if that was empty, i.e. backwards).
+
+**Fix + Attempt 3 (00:1x-00:39, run `ap-5vIReb5w2Szc7eRCgdpCNL`), SUCCESS:** Rewrote `measure_attn_mass_per_task.py`: classify on `prompt` using phrase rules derived directly from the real instruction templates ("into the bin"->BinFill, "just as it reaches"->StopCube, "right-side target"->SwingXtimes, "repeating this action"/"place it on the target"->PickXtimes); read a 640-example window from inside each task's already-known block (start indices 10000/80000/125000/160000) instead of scanning from 0; run each task's window as its own subprocess (fresh model load) to avoid the Attempt-2 OOM, matching the same fix `measure_representation_alignment.py` already used for its own two-condition OOM (2026-08-28 entry below). All 4 subprocesses completed cleanly with 0 mismatches and 0 unclassified out of 640 each -- highest-confidence run of the three.
+
+| Task | attn_mass_sym mean | std | n | window start idx |
+|---|---|---|---|---|
+| BinFill | 0.4401 | 0.0580 | 640 | 10000 |
+| StopCube | 0.4180 | 0.0672 | 640 | 125000 |
+| SwingXtimes | 0.4094 | 0.0618 | 640 | 160000 |
+| PickXtimes | 0.3850 | 0.0507 | 640 | 80000 |
+
+**Reading:** BinFill sits above both SwingXtimes (+0.031) and StopCube (+0.022), in the direction the hypothesis predicts, and the gap is too large relative to std/sqrt(n)=640 to be sampling noise (~6-9 standard errors on each comparison). But it's a small effect -- the full 4-task spread is only 0.055 on a 0-1 scale, closer to "a small, statistically real lean" than to "strong, decisive task-dependent arbitration." Not full gate collapse (numbers aren't identical across tasks, unlike the OLD design's `gate_perc=1.0±0.0` full collapse, 2026-08-28 22:14 entry below), but not a dramatic split either.
+
+---
+
+### 2026-09-01 16:03 — Arm D v1 eval paused again at 356/600 -- trend now stable, holding well below v0
+**Tags:** #baseline
+
+**Paused (user request):** stopped `ap-38EWhEtVq3XZ0MabkU0O3b` (confirmed stopped/0 tasks), snapshotted to `v1_eval_episodes.csv` (356 rows). Per-task rates barely moved between the 307/600 and 354/600 checks just before this (e.g. overall 31.60% -> 30.51%), i.e. the gap vs. v0 looks like a stable trend at this point, not sampling noise that's still resolving:
+
+| Task | v1 @ 356/600 (n≈85-90) | v0 (n=150, complete) |
+|---|---|---|
+| BinFill | ~33% | 37.3% |
+| PickXtimes | ~42% | 74.7% |
+| SwingXtimes | ~28% | 83.3% |
+| StopCube | ~19% | 37.3% |
+| Overall | ~30.5% | 58.17% |
+
+Every task is down, not just one -- consistent with the working hypothesis floated mid-eval (13:xx conversation, not yet its own log entry): training `mem_attn_fused`/`mlp_fused` fully from scratch may have traded "collapses to one stream" for "hasn't yet relearned general cross-attention competence in the 10k-step budget" -- a different problem than the one this fix targeted. Not confirmed; needs the completed run and the per-task attn_mass breakdown (handed off to the other Claude session) to actually distinguish "learned to arbitrate but is generally weaker" from "still not really arbitrating."
+
+**To resume:** same as before, `MODAL_PROFILE=arm-d-eval modal run --detach ...::run_batch --max-new-episodes 600`, no special resume flag.
+
+---
+
+### 2026-09-01 13:40 — Arm D v1 eval resumed at 182/600
+**Tags:** #baseline
+
+Resumed (`MODAL_PROFILE=arm-d-eval modal run --detach ...::run_batch --max-new-episodes 600`), new app `ap-38EWhEtVq3XZ0MabkU0O3b`. No special resume argument needed -- confirmed the dispatch logic picked up exactly where it left off (skipped re-downloading the already-cached checkpoint, will skip the 182 already-completed (seed,task,episode) keys automatically). 30-minute progress monitor restarted alongside it, using `MODAL_PROFILE=` on every check now instead of `modal profile activate` (13:32 entry's fix).
+
+---
+
+### 2026-09-01 13:36 — Arm D v1 eval paused at 177/600 (user request)
+**Tags:** #baseline
+
+**Paused, not killed:** stopped `ap-0UZ79USdURHXETILUNWPgj` (`MODAL_PROFILE=arm-d-eval modal app stop ... -y`, confirmed via a follow-up `app list` showing `stopped`/0 tasks, not just trusting the stop command's own silence) and the 30-minute progress monitor (no longer useful with nothing running). 177/600 episodes are durably saved on the `robomme-arm-d-v1-eval-results` volume and already snapshotted to `v1_eval_episodes.csv` (13:32 entry).
+
+**To resume later:** just re-invoke `MODAL_PROFILE=arm-d-eval modal run --detach arm_d_dynamic_fusion/eval/run_pilot_eval.py::run_batch --max-new-episodes 600` -- no special resume flag needed, unlike training checkpoints. `run_batch_remote` always recomputes pending work as (full 600-job protocol) minus (whatever's already durably on the results volume), so it will pick up exactly the remaining ~423 episodes on its own.
+
+---
+
+### 2026-09-01 13:32 — Arm D v1 eval: progress snapshot saved (177/600), and a real `modal profile` gotcha found
+**Tags:** #infra #baseline
+
+**Snapshot saved:** `dump_episodes` run mid-eval (not waiting for completion, per user request to pause and continue later) -- wrote 177 episode records to `arm_d_dynamic_fusion/eval/v1_eval_episodes.csv` (+ companion README), same format as the OLD checkpoint's `pilot_eval_episodes.csv`. The underlying `run_batch_remote` batch keeps running independently on Modal regardless of this snapshot -- `dump_episodes` only reads the results volume, it doesn't touch the running batch.
+
+**Gotcha found while trying to split eval (this session) and a new diagnostic analysis (a second Claude session, per user's explicit request) across the two Modal accounts safely:** `modal profile activate <name>` mutates a SHARED, persistent local setting (not scoped to one shell/process) -- any `modal` command run afterward, by ANY process on this machine, silently inherits whichever profile was last activated. This already caused one real mistake this session: switching to `nour-mkawni` to run a training-data diagnostic, then a scheduled eval-progress check fired before switching back and reported a bogus "0/600" against the wrong account (no real data was affected -- `show_results`/`list_progress` are read-only -- but it was a confusing false reading).
+
+**First proposed fix was WRONG and got corrected before being acted on:** initially told the user to use a `--profile <name>` flag on `modal run` -- this flag does not exist (`modal run --help`/`modal profile --help` confirm no such option). Verified the ACTUAL correct mechanism directly before using it again: the `MODAL_PROFILE=<name>` environment variable, prefixed on any single command (e.g. `MODAL_PROFILE=arm-d-eval modal run ...`), overrides the active profile for just that invocation without touching the shared config file -- confirmed working via `MODAL_PROFILE=arm-d-eval modal profile current` / `MODAL_PROFILE=nour-mkawni modal profile current` both returning correctly. This is the mechanism to use going forward for any command touching either Arm D Modal account, instead of `modal profile activate`.
+
+**Not yet done:** the rest of the 600-episode eval (batch still running); the per-task attn_mass diagnostic (handed off to a separate Claude session per the user's request, to keep this session's Modal account state limited to `arm-d-eval` only).
+
+---
+
+### 2026-09-01 11:42 — Arm D v1 full eval launched (noor-koni2002 account, 600 episodes, same protocol as the OLD checkpoint)
+**Tags:** #baseline
+
+**Goal:** User request: evaluate `Nkoni/arm-d-v1` (the early-fusion-no-warmstart checkpoint) on the exact same protocol as the OLD checkpoint (3 seeds x 4 Counting-suite tasks x 50 episodes/task = 600 episodes) from the `arm-d-eval`/`noor-koni2002` account, saving results as `v1_eval_episodes.csv`. Two specific questions to answer once done: (1) does the 64-vs-512 token-count issue look solved in practice, (2) does early fusion produce better eval results than the OLD two-cross-attention-plus-router design.
+
+**Changes to `run_pilot_eval.py`:** `HF_CKPT_REPO`/`HF_CKPT_LOCAL_NAME` repointed at `Nkoni/arm-d-v1`; `results_volume` changed to a NEW volume (`robomme-arm-d-v1-eval-results`) -- reusing the OLD results volume would have been silently wrong, since `run_batch_remote`'s resume logic treats any already-present `(seed, task_id, episode_idx)` as done, and the OLD volume already has all 600 such keys filled for the OLD checkpoint (would have reported "0 pending" for a completely different checkpoint). `dump_episodes`'s default output renamed to `v1_eval_episodes.csv` per the user's explicit request.
+
+**Verification before the full run:** `run_smoke_test` (cheap synthetic-observation check, no simulator) confirmed the checkpoint loads and produces valid actions (`action_shape=[20,8]`, finite) through the actual eval/inference code path -- worth doing since this is the first time this checkpoint has gone through `ArmDPolicy`/`create_arm_d_trained_policy` rather than training's `compute_loss`, a genuinely different code path (`sample_actions`, no gradients).
+
+**Launched:** `modal run --detach run_pilot_eval.py::run_batch --max-new-episodes 600`. Confirmed 0 collisions with the OLD checkpoint's results ("Total pilot protocol: 600 episodes. Already done: 0. Pending: 600."). Spawned as `fc-01M1E215R2JYQVRF8SY003G8D0` under app `ap-0UZ79USdURHXETILUNWPgj`.
+
+**Monitoring:** persistent background monitor checking progress every 30 minutes, will report full completion or (if the OLD run's precedent of hitting the 6h function timeout and needing manual resume repeats here) flag that a resume is needed rather than resuming unattended -- deliberately not automating the resume decision itself, to avoid the exact "two concurrent batches running at once" mistake documented in the 2026-08-24 17:15 entry for the OLD eval.
+
+**Not yet done:** everything -- eval is in progress. `dump_episodes` (producing `v1_eval_episodes.csv`) and the two comparison questions above once it completes.
+
+---
+
+### 2026-08-31 20:42 — Arm D early-fusion-no-warmstart checkpoint (step 9999) published as "arm-d-v1"
+**Tags:** #baseline
+
+**Goal:** Training finished (2026-08-30, ~2h27m wall-clock, checkpoints at 2000/4000/6000/8000/9999 -- see prior entries for the step-2000/4000/6000 health checks, all consecutively healthy). User asked to publish it to HF Hub for cross-account access, same as the original pilot checkpoint, and to name it "arm-d-v1" specifically to distinguish it from the OLD two-cross-attention-plus-router mechanism's checkpoint.
+
+**Changes:** `upload_checkpoint.py`'s `EXP_NAME`/`HF_REPO_ID` were hardcoded to the OLD run ("counting-suite-pilot" / "Nkoni/arm-d-counting-suite-pilot") -- parameterized both (still defaulting to sensible values) and repointed the defaults at this run: `EXP_NAME="counting-suite-early-fusion-no-warmstart"`, `HF_REPO_ID="Nkoni/arm-d-v1"`. The OLD repo is untouched and still separately available.
+
+**Published:** step 9999, 6.23 GB zip -> **https://huggingface.co/Nkoni/arm-d-v1/blob/main/9999.zip**. Same zip layout convention as the original (`unzip_ckpt.py`-compatible, step number as the internal top-level directory) -- any future eval/analysis script can point at this repo exactly the way `run_pilot_eval.py`/`measure_gate_arbitration.py` already point at the old one.
+
+**Not yet done:** running eval against this checkpoint (explicitly on hold per user's instruction until they say so); updating `run_pilot_eval.py`/`measure_representation_alignment.py`/`measure_gate_arbitration.py` to have an easy switch to this new published repo (currently they'd need the same kind of constant edit `upload_checkpoint.py` just got).
+
+---
+
+### 2026-08-30 15:55 — Arm D early-fusion, attempt 2: step-6000 check -- stable layer specialization, bias lever now tracking content
+**Tags:** #baseline
+
+**Results:** `attn_mass_sym` overall mean 37.4% (up from 32.0% at step 4000), std 0.244 (still wide). Per-layer pattern is now visibly STABLE across checkpoints, not just noisy: layer 1 (77.7% -> 77.6%), layer 0 (60.1% -> 71.8%), layer 17 (65.8% -> 53.5%) remain the consistently symbolic-favoring layers; layer 12 remains the consistent low point (4.5% -> 3.6%). Same layers, same direction, two checkpoints apart -- looks like real learned specialization settling in, not random fluctuation.
+
+**Bias lever:** now mostly positive (17/18 layers), max magnitude grown to ~0.019 (layer 2) from ~0.007 at step 4000 -- still small relative to what would be needed to drive attn_mass alone (per CHECK5, needs ~4-10), but notably: layer 12 is the ONE layer where `bias_sym` is negative, and layer 12 is also the one layer with the lowest attn_mass_sym. The lever is now tracking and reinforcing the same pattern the content-based learning is producing, not fighting it (unlike attempt 1, where a uniformly-signed lever sat underneath a uniform collapse).
+
+**Decision:** three consecutive healthy checks (2000/4000/6000), consistent and improving. No action needed. 4000 steps remain (~30-40 min at observed pace).
+
+---
+
+### 2026-08-30 15:30 — Arm D early-fusion, attempt 2: step-4000 check -- attn_mass_sym now ABOVE the dilution floor, real per-layer differentiation emerging
+**Tags:** #baseline
+
+**Results (`measure_gate_arbitration.py`, step 4000 vs. step 2000):**
+| | step 2000 | step 4000 |
+|---|---|---|
+| `attn_mass_sym` overall mean | 10.4% | **32.0%** |
+| `attn_mass_sym` overall std | 0.066 | **0.257** |
+| per-layer mean range | 4.6%-19.6% (narrow) | **4.5%-77.7%** (wide) |
+
+`attn_mass_sym` is now well ABOVE the theoretical dilution floor (11.1%), not just sitting at it -- and per-layer variance nearly quadrupled. Per-layer means show real spread: layers 1/17/0 at 78%/66%/60% (favoring symbolic), layers 12/13/3 at 4.5%/9.6%/13.7% (still favoring perceptual). This looks like genuine layer specialization emerging, not uniform behavior in either direction -- the kind of differentiated pattern a healthy, arbitrating gate should show, in contrast to both the OLD design's exact uniform 100/0 collapse and attempt 1's uniform near-total suppression.
+
+**Bias lever (`inspect_bias_lever.py`):** still tiny (max ~0.0066 magnitude) -- confirms the jump to 32% is coming from `mem_attn_fused`'s own (now training-from-scratch) content-matching ability actually learning to value symbolic tokens, not from the bias correction term. Worth noting: `bias_sym` flipped from uniformly negative (step 2000, all 18 layers) to mostly positive (step 4000, 11/18 layers) -- a small but directionally encouraging sign, on top of the much larger content-driven effect.
+
+**Decision:** continues to look healthy, no action needed. Next check at step 6000.
+
+---
+
+### 2026-08-30 15:04 — Arm D early-fusion, attempt 2: step-2000 check looks healthy -- no-warmstart fix confirmed working
+**Tags:** #baseline
+
+**Goal:** Check `attn_mass_sym`/`attn_mass_perc` at step 2000 for the no-warmstart run (14:18 entry below), per the standing hard-stop rule, before letting it continue further.
+
+**Results:**
+| | attempt 1 (warm-started mem_attn_fused), step 2000 | attempt 2 (fresh mem_attn_fused), step 2000 | theoretical dilution baseline (64/576) |
+|---|---|---|---|
+| `attn_mass_sym` overall mean | 3.3% | **10.4%** | 11.1% |
+| per-layer range | ~0.03%-18.3% (most layers near 0, a few spikes) | **4.6%-19.6%** (every layer nontrivial) | -- |
+| per-layer std | up to 0.19 (very uneven) | 0.019-0.087 (real variance everywhere, no dead layers) | -- |
+
+`attn_mass_sym` is now sitting almost exactly AT the theoretical dilution floor (10.4% vs. 11.1%) instead of being pushed well below it (3.3% in attempt 1). Every one of the 18 layers now shows meaningful, non-collapsed attention to symbolic content, not just a handful of spikes surrounded by near-zero layers. This directly confirms the 14:02 entry's diagnosis: removing the warm-start bias fixed the artificial suppression -- the model is no longer starting from "already convinced perceptual is all that matters," just from the honest, expected, correctable count-driven floor.
+
+**Bias lever check (`inspect_bias_lever.py`):** still tiny (-0.0002 to -0.005 range) -- consistent with the improvement coming entirely from removing the warm-start bias, not from the lever doing new work. Expected: sitting right at the dilution floor means there's not yet a strong training signal pushing the lever to do more; whether it activates to push symbolic attention ABOVE the floor for content where that's warranted (the actual hypothesis under test -- task-dependent arbitration) is what future checkpoints (4000, 6000...) will show.
+
+**Decision:** training continues uninterrupted this time -- step 2000 shows no red flag, unlike attempt 1. Will keep checking at each subsequent 2000-step checkpoint for the SAME failure signature (attention collapsing well below the dilution floor, or one stream's mass going to ~0 with zero variance) but won't stop again unless that reappears.
+
+---
+
+### 2026-08-30 14:18 — Arm D early-fusion, attempt 2 launched: mem_attn_fused/mlp_fused now train from scratch
+**Tags:** #baseline
+
+**Goal:** Test the fix decided on after the 14:02 entry's investigation: since the warm-started mem_attn_fused (pretrained exclusively on perceptual content) dominated the observed attention-mass split -- not the bias_sym/bias_perc lever, which barely moved -- train mem_attn_fused/mlp_fused from scratch this time, leaving everything else (LoRA-adapted backbone, perceptual_mem_encoder) warm-started exactly as before. Explicitly decided NOT to also pool perceptual's 512 tokens down to match symbolic's 64 (user's call: don't sacrifice visual detail) -- confirmed with the user that the token-count dilution effect has its own non-destructive fix already (bias_sym/bias_perc, verified full-range capable via smoke_test.py's CHECK5) and isn't what caused the observed collapse anyway, so it doesn't need to be bundled into this attempt.
+
+**Changes:** `warm_start_loader.py` gained `WARM_START_FUSED_ATTENTION = False` -- when False, `mem_attn`/`mem_rms_norm_ffn` renames are excluded from `FUSED_ATTENTION_RENAMES` entirely, so `mem_attn_fused`/`mlp_fused` fall through to fresh init (the `mem_encoder` -> `perceptual_mem_encoder` rename is untouched, applies either way). `launch_pilot_training.py`'s `EXP_NAME` changed again, to `"counting-suite-early-fusion-no-warmstart"`, so this attempt gets its own checkpoint directory -- neither the original old-mechanism pilot's nor the stopped first-early-fusion-attempt's checkpoints are overwritten.
+
+**Verification before launching:** `run_tentative` confirmed the intended effect directly -- `mem_attn_fused`'s `q_einsum_mem`/`kv_einsum_mem`/`mem_rms_norm`/`out_einsum_mem`/`bias_sym`/`bias_perc` and `mlp_fused`'s `kernel`/`bias` all now appear in the "Merging missing weight" log lines (fresh init), a direct flip from the first attempt where those exact same keys were loaded from the checkpoint. Step 0: `loss=0.1611`, `grad_norm=1.5706` -- larger than the first attempt's `grad_norm=0.3315`, as expected (fresh-init params typically produce larger initial gradients than a well-calibrated warm start; not a red flag on its own).
+
+**Launched:** `modal run --detach .../launch_pilot_training.py::run_training`. Spawned as `fc-01M1968X2X5QJ26T3N5R08WQT2` under app `ap-SEL00zCbBz6xpKoV6gBg9P`, `nour-mkawni` account. Checkpoints land at `ckpts/arm_d_pilot/counting-suite-early-fusion-no-warmstart`, every 2000 steps.
+
+**Plan:** same as the first attempt -- check `attn_mass_sym`/`attn_mass_perc` (`measure_gate_arbitration.py`, `LOCAL_CHECKPOINT_STEP` updated to point at this run's checkpoints) at step 2000 before letting it run further, per the standing 2026-08-29 16:20 hard-stop rule.
+
+**Not yet done:** the step-2000 check above; if this attempt looks healthy, still need the full-run eval and the representation-alignment re-check.
+
+---
+
+### 2026-08-30 14:02 — Arm D early-fusion training: stopped at step ~3150, root cause found -- warm-start bias, NOT the bias lever
+**Tags:** #idea #failed
+
+**Goal:** Follow-up to the 13:08 entry below. Step-2000 checkpoint check showed `attn_mass_sym` at 3.3% (down from the ~11-14% random-init dilution baseline, i.e. moving toward MORE perceptual dominance during training, not less) -- concerning per the 2026-08-29 16:20 hard-stop decision, though not an exact repeat of the old design's uniform 100.000%/0.001% collapse (real per-layer structure: layers 9/11/15 showed 11-18% symbolic mass, most others near 0). User's call: stop training and investigate before spending more GPU-hours on a possibly-wrong trajectory.
+
+**Action:** Stopped the running app (`modal app stop ap-OtPMiQkMi5mdb6pjggCjoA -y`, confirmed via `modal app list` showing 0 tasks/stopped, not just trusting the CLI's own success message -- per this project's established "don't trust a stop notification, verify" practice). Training had reached ~3150/10000 steps (48m51s elapsed) before stopping -- loss was moving in a normal-looking range (0.070-0.083) over the last ~100 logged steps, no smoking gun there.
+
+**New diagnostic built to isolate the mechanism:** `analysis/inspect_bias_lever.py` -- cheap, CPU-only, reads `bias_sym`/`bias_perc` directly out of a checkpoint's params (no forward pass, no real data) to answer a specific question: is the observed attn_mass skew coming from (a) the bias lever itself being pushed toward reinforcing perceptual, or (b) something else entirely, with the lever barely touched?
+
+**Result: clearly (b).** At step 2000, `bias_sym`/`bias_perc` per layer are tiny -- ranging roughly -0.002 to -0.010 (sym) and the mirrored positive value (perc), e.g. layer 16: bias_sym=-0.0105, bias_perc=+0.0105. For scale: `smoke_test.py`'s CHECK5 bias sweep showed it takes a bias difference on the order of *4 to 10* to meaningfully move attn_mass_sym (0.4 -> 0.97 at +4, -> 0.0 at -10). A ~0.01-0.02 differential is roughly 200-1000x too small to explain a shift from an ~11-14% baseline down to 3.3%. The lever moved (consistently negative for sym, consistently positive for perc, across all 18 layers -- so if anything it's nudging the WRONG direction, not correcting), but its magnitude is negligible -- it is not the mechanism causing the observed skew.
+
+**Root cause, by elimination:** `mem_attn_fused`'s warm-started weights (`q_einsum_mem`/`kv_einsum_mem`/`mem_rms_norm`/`out_einsum_mem`, transferred from the released FrameSamp+Modul checkpoint's `mem_attn` -- see `warm_start_loader.py`) were pretrained EXCLUSIVELY on perceptual content; the released single-stream model never had a symbolic stream to attend to. Symbolic tokens are effectively out-of-distribution for those specific pretrained projections, independent of the token-count dilution effect `bias_sym`/`bias_perc` were built to address and independent of whatever `contrastive_alignment_loss`/`UnifiedMemoryEncoder` are doing to the streams' representations upstream -- alignment_loss only makes M_sym/M_perc's per-example SUMMARIES comparable, it does not touch `mem_attn_fused`'s own attention computation or teach its already-pretrained Q/K projections to treat symbolic content as relevant. 2000 steps of fine-tuning (20% of the planned run) was not enough to overcome this pretrained head start, and the trend was toward reinforcing it, not correcting it.
+
+**Implication:** this is a genuinely different problem than the one `bias_sym`/`bias_perc` were designed for. Warm-starting `mem_attn_fused` from a perceptual-only pretrained checkpoint may be handing the model a bias no cheap correction term can practically undo in a 10k-step budget. Candidate next steps (not yet decided):
+1. Train `mem_attn_fused`/`mlp_fused` from scratch (fresh init, no warm start for the fusion mechanism specifically) -- loses the "already knows how to do useful cross-attention into memory" head start, but removes the perceptual-only pretraining bias entirely.
+2. Keep the warm start but analytically initialize `bias_sym`/`bias_perc` to a much larger, deliberately-chosen value (not zero) as a blunt-force counterweight while the model learns -- addresses this on top of the token-count dilution case, though it's a hand-tuned patch rather than a fix to the underlying mismatch.
+3. Some hybrid (e.g. a higher learning rate specifically for `mem_attn_fused`'s params, or freezing the OTHER, definitely-perceptual-tuned weights less aggressively) -- not scoped out yet.
+
+**Not yet done:** deciding between the above with the user; any of them requires another training run before it can be checked.
+
+---
+
+### 2026-08-29 15:53 — Arm D: fusion moved before cross-attention (early fusion, single cross-attention, no router)
+**Tags:** #idea
+
+**Goal:** Per the user's supervisor's explicit direction (2026-08-29 conversation): fuse the two memory streams into ONE representation BEFORE cross-attention, with a single cross-attention reading that fused memory -- not the two-cross-attention-plus-router design from the entries below. Rationale discussed with the user: concatenating the two streams into one sequence only makes sense once every token (symbolic or perceptual) is measured in the same units, which is exactly what `unified_memory_encoder.py` (14:37 entry below) already provides -- these two changes are sequenced deliberately, not independent.
+
+**Design (see `joint_gated_modulator.py`'s rewritten docstring for full detail):**
+- **Modality tags** (`tag_sym`/`tag_perc`, learned per-layer vectors, small-random-init): added to each stream's tokens before concatenation, since position in the fused 576-token sequence carries no information on its own -- this is what lets attention use "which stream is this" as a content signal.
+- **Concatenate**: `M_fused = concat([M_sym + tag_sym, M_perc + tag_perc])`, one 576-token sequence, one mask.
+- **One cross-attention** (`FusedMemoryAttention`, forked from the released `MemoryAttention` since it needs a hook the released code doesn't have -- see below): action-expert query attends over the single fused sequence.
+- **Learned per-stream score bias** (`bias_sym`/`bias_perc`, two scalars per layer, zero-init): added to attention scores before the softmax specifically to counter a real, verified effect -- see Results below.
+- **One modulation MLP** (`mlp_fused`, near-zero-init): produces (scale, shift) from the single attention result, same AdaLN-Zero convention as before.
+
+**Removed:** the two-stream router and the two separate per-stream `MemoryAttention`/MLP pairs it combined (`JointGatedModulator`, `gate_sym`/`gate_perc`), and `balance_loss` (the load-balancing loss doesn't apply to a design with no 2-way gate). `EarlyFusionModulator` sows `attn_mass_sym`/`attn_mass_perc` instead -- a read-only record of realized attention mass per stream, not a trained decision variable. Class renamed `JointGatedModulator` -> `EarlyFusionModulator`; the nnx attribute name `"joint_gated_modulator"` was deliberately kept unchanged in `history_gemma_dual.py` so `ArmDConfig.get_freeze_filter()`'s exemption regex keeps matching without its own edit.
+
+**Verified the numerosity-dilution concern empirically, not just theoretically:** discussed with the user beforehand that a single softmax over 64 symbolic + 512 perceptual tokens should, absent any content signal, assign roughly equal weight per *token* -- meaning perceptual's sheer count advantage would claim most of the attention mass by default, independent of relevance. `smoke_test.py`'s CHECK1 (toy shapes s_sym=8/s_perc=12) confirms this directly at random init with the bias terms still at their zero-init (no correction): observed `attn_mass_sym_mean=0.4142` vs. the theoretical dilution baseline `s_sym/(s_sym+s_perc)=0.4000` -- a near-exact match. CHECK3 (real 64/512 config, constant-filled synthetic data) shows the same pattern at the real scale: `attn_mass_sym_mean=0.138` vs. theoretical `64/576=0.111`. This is exactly why `bias_sym`/`bias_perc` exist -- confirmed the problem is real before, not after, committing to the fix.
+
+**Implementation went cleanly:** unlike the balance_loss wiring (14:37 entry below, 4 failed attempts before success), this rewrite passed all 4 `smoke_test.py` checks on the first real run -- CHECK1 (isolated math), CHECK2 (scanned stack), CHECK3 (full ArmDModel end-to-end, including the same `mutable=["intermediates"]` extraction mechanism now reading `attn_mass_sym`/`attn_mass_perc` instead of `gate_sym`/`gate_perc`/`balance_loss`), CHECK4 (gradient flow, toy-scale, unchanged from the prior entry's setup minus the removed `balance_loss` term).
+
+**Not yet done:** retraining (the existing step-9999 checkpoint is now for a completely different mechanism and can't be warm-started onto this directly without new work); deciding how to warm-start the new `mem_attn_fused`/`mlp_fused` from the released single-stream checkpoint, if at all (open question, not addressed this pass); updating `measure_gate_arbitration.py` to read `attn_mass_sym`/`attn_mass_perc` instead of the now-removed `gate_sym`/`gate_perc`.
+
+---
+
+### 2026-08-30 13:08 — Arm D early-fusion training launched (real run, after clean warm-start verification)
+**Tags:** #baseline
+
+**Goal:** Set up and launch training under the early-fusion redesign (2026-08-29 entries above). Two things needed doing first: (1) `warm_start_loader.py`'s rename mapping targeted the OLD `joint_gated_modulator/mem_attn_perc`/`mlp_perc` paths, which no longer exist -- updated to `mem_attn_fused`/`mlp_fused`, justified structurally (`FusedMemoryAttention` was forked from the released `MemoryAttention` with identical q/k/v/out-projection shapes, so the released single-stream weights are a legitimate starting point for the new fused attention -- see `warm_start_loader.py`'s updated docstring for the full argument); (2) `launch_pilot_training.py`'s `exp_name` changed from `"counting-suite-pilot"` (the completed OLD-mechanism run) to `"counting-suite-early-fusion"`, so this run gets its own checkpoint directory instead of overwriting the old one's (results already preserved on HF Hub and in this log regardless, but no reason to risk it locally).
+
+**Verification before committing GPU-hours:** ran `run_tentative` (the cheap ~10-step smoke run) first, per this project's own established practice for exactly this kind of unverified-rename risk. Succeeded cleanly on the first attempt: checkpoint restored from the real released checkpoint in 8.8s, `joint_gated_modulator/mem_attn_fused`'s `q_einsum_mem`/`kv_einsum_mem`/`mem_rms_norm`/`out_einsum_mem` and `mlp_fused` all loaded from the checkpoint (confirmed by NOT appearing in the "Merging missing weight" log lines), and only the genuinely-new params (`tag_sym`/`tag_perc`/`bias_sym`/`bias_perc`/`unified_memory_encoder/*`/`symbolic_mem_encoder/*`) fell through to fresh init, exactly as designed. Step 0: `loss=0.1430`, `grad_norm=0.3315`, `llm_grad_norm=0.1101`, `param_norm=1875.97` -- finite, sane. 11/10 tentative steps completed.
+
+**Bonus finding:** `Trainable Model Size: 551.7 MB` and peak memory ~14.9GiB at batch_size=4 -- comfortably under the A10G's 24GB, with visibly more headroom than the OLD design had at the same batch size (that one was memory-tight enough that batch_size=16 and 8 both OOM'd, see 2026-08-23 19:03 entry). Consistent with the architecture change: one shared `MemoryAttention`-equivalent instead of two separate full ones.
+
+**Note (user question):** the tentative run's console log does NOT show `attn_mass_sym`/`attn_mass_perc` -- `scripts/train.py` only prints `grad_norm`/`llm_grad_norm`/`loss`/`param_norm` (the `info` dict); `compute_loss`'s `stats` dict (which has the attn_mass values) is computed every step but only ever displayed under a `representation_type == "recurrent"` branch that never fires for Arm D. Not observable from this log either way -- 11 steps from a fresh warm-start is far too little exposure to mean anything regardless.
+
+**Launched:** `modal run --detach .../launch_pilot_training.py::run_training` (num_train_steps=10000, resum_ckpt_id=None, fresh start). Spawned as `fc-01M19286K82A2B8ERWA9VZDPX0` under app `ap-OtPMiQkMi5mdb6pjggCjoA`, `nour-mkawni` account. Checkpoints land at `ckpts/arm_d_pilot/counting-suite-early-fusion` on the `robomme-arm-d-pilot-training` volume, every 2000 steps.
+
+**Plan to catch re-collapse EARLY, not just at the end (per the 2026-08-29 16:20 decision):** once the step-2000 checkpoint lands, run `measure_gate_arbitration.py` against it rather than waiting for the full 10k steps -- if `attn_mass_perc` is already pinned near 1.0 that early, there's no reason to spend the remaining GPU-hours before investigating.
+
+**Not yet done:** watching this run to completion; the step-2000 early check above; running `measure_representation_alignment.py` against the resulting checkpoint; the hard collapse-check requirement before trusting any eval number from this run.
+
+---
+
+### 2026-08-29 16:04 — Arm D: bias-lever full-range check (CHECK5) + measure_gate_arbitration.py updated
+**Tags:** #idea
+
+**Goal:** User asked directly: can we check that the new fused-attention design actually listens to symbolic and perceptual equally, not leaning toward perceptual? Answer required distinguishing two different claims -- "is it currently balanced" (no, and it shouldn't be expected to be: at bias=0/untrained, the numerosity-dilution effect from the 15:53 entry is still fully present) vs. "CAN the correction mechanism actually deliver balance, or full symbolic preference, if training decides it's needed" (the real, checkable question for an architecture that hasn't been trained yet).
+
+**Setup:** New `smoke_test.py` CHECK5. Manually overrides `bias_sym` (bypassing training entirely) across a sweep `[-10, -4, 0, 4, 10]` on a freshly-initialized `EarlyFusionModulator`, re-running the forward pass at each value and recording `attn_mass_sym`.
+
+**Results:** `attn_mass_sym` by `bias_sym`: -10 -> 0.0, -4 -> 0.0134, 0 -> 0.3989 (matches the 15:53 entry's dilution baseline exactly), 4 -> 0.9681, 10 -> 0.9999. Strictly monotonic, saturates near both 0 and 1.
+
+**Notes:** Confirms the bias lever has full expressive range -- nothing about the fused-softmax/token-count-imbalance structurally caps symbolic's ability to compete, regardless of what training ultimately decides. This is architecture-level proof-of-capability, not a claim about current (untrained) behavior -- that still requires an actual training run to observe.
+
+**Also updated per user request:** `analysis/measure_gate_arbitration.py` now reads `attn_mass_sym`/`attn_mass_perc` (renamed throughout, extraction logic otherwise unchanged) instead of the removed `gate_sym`/`gate_perc`. Flagged clearly in the script that it cannot actually be run yet: the published `Nkoni/arm-d-counting-suite-pilot` step-9999 checkpoint is for the old two-attention-plus-router mechanism entirely and won't load into the new `ArmDModel`'s param structure (no more `router`/`mem_attn_sym`/`mem_attn_perc`/`mlp_sym`/`mlp_perc`; now `tag_sym`/`tag_perc`/`mem_attn_fused`/`mlp_fused`). Ready to use once a checkpoint trained under the new mechanism exists.
+
+---
+
+### 2026-08-29 14:37 — Arm D: shared encoder + alignment loss + balance_loss wired in, verified end-to-end
+**Tags:** #idea
+
+**Goal:** Implement the fix decided on in the 2026-08-28 22:14 entry: a shared post-projection encoder + contrastive alignment loss (targets the zero-correspondence finding) and wiring `JointGatedModulator`'s `balance_loss` into training (targets the gate-collapse finding), since neither problem would fix itself.
+
+**Changes:**
+- New `models/unified_memory_encoder.py`: `UnifiedMemoryEncoder` (parameter-free RMSNorm + small residual MLP, near-zero-init output projection) applied with the SAME weights to both `M_sym` and `M_perc` in `ArmDModel.embed_memory`; `contrastive_alignment_loss` (symmetric InfoNCE over per-example mean-pooled streams).
+- `models/arm_d_pi0.py`: new `ArmDConfig.balance_loss_weight` (0.01) / `alignment_loss_weight` (0.1) fields (not yet tuned); `compute_loss` now extracts `balance_loss`/`gate_sym`/`gate_perc` from `JointGatedModulator`'s sown intermediates and adds `balance_loss_weight * balance_loss + alignment_loss_weight * alignment_loss` into the per-timestep loss array (the only place a new scalar loss can actually reach the optimizer, given `scripts/train.py`'s `loss_fn` only differentiates `jnp.mean(chunked_loss)`, treating `stats` as pure `has_aux`). `stats` changed from always-`None` to a real diagnostics dict.
+- `unified_memory_encoder` needed no freeze-filter change (top-level attribute containing "mem" in its name, already covered by the existing regex, same as `symbolic_mem_encoder`/`perceptual_mem_encoder`).
+
+**The specific unresolved plumbing question got settled empirically:** `self.PaliGemma.llm(..., mutable=["intermediates"])` (the nnx_bridge-wrapped call) does NOT surface the sown collection for this installed flax version -- confirmed via a temporary smoke_test.py CHECK4 (silently returns the same 2-tuple as an ordinary call). What works: extract the wrapped `flax.linen.Module` directly (`self.PaliGemma.llm.module`) and current params (`nnx.state(self.PaliGemma.llm, nnx.Param).to_pure_dict()`), call `.apply(variables, ..., mutable=["intermediates"])` on the linen module directly -- the same call shape `smoke_test.py`'s CHECK2 already used with synthetic params, now with real ones.
+
+**Bugs hit fixing this (all caught by smoke_test.py before any GPU-hours were spent on a real training run):**
+1. Collapsed the raw-linen apply's return structure by one nesting level (`(prefix_out, suffix_out), mutated = ...` instead of the correct `(outputs, kv_cache), mutated = ...` then `prefix_out, suffix_out = outputs`) -- `suffix_out` silently became `kv_cache` instead, caught immediately by a `TypeError` on the next line's slice.
+2. Verifying gradient flow through the new extraction mechanism (not just forward-value correctness) needed 4 attempts: two OOM'd trying to exercise it through a full ~2.3B-param `ArmDModel` (once reusing a non-LoRA model and differentiating almost the whole backbone, once rebuilding a fresh LoRA model in the same process without the first one's memory released), a third OOM'd on a toy-scale `DualMemoryModule` sized too small (width=32) -- `MemoryAttention` (released code) hardcodes width=1024 internally ("same dim as the action expert in pi05"), unrelated to anything under test -- and the fourth (correct toy width=1024, matching CHECK2's own already-proven config, PLUS explicitly dropping CHECK3's full model/`gc.collect()` first) finally isolated the mechanism cheaply and passed: `grad_norm=0.073423`, finite and nonzero.
+
+**Verification (smoke_test.py, all 4 checks OK):** CHECK3 confirms real values, not just plumbing -- on a fresh random-init model, `gate_sym_mean`/`gate_perc_mean` are exactly 0.5/0.5 and `balance_loss` is exactly 0.0 (matching CHECK1's isolated result for the same module), and `alignment_loss` is exactly `ln(batch_size)=ln(2)=0.6931` (exactly the value an untrained, uncorrelated pair of streams should produce). CHECK4 confirms gradients reach the mechanism correctly.
+
+**Not yet done:** retraining with these changes (the existing step-9999 checkpoint predates all of this) and re-running `measure_representation_alignment.py`/`measure_gate_arbitration.py` against a new checkpoint to confirm the fix actually worked in practice, not just that it's wired correctly. Loss weights are first-guess defaults.
+
+---
+
+### 2026-08-28 22:14 — Arm D: gate has fully collapsed to perceptual-only (real-data check, trained checkpoint)
+**Tags:** #baseline #idea
+
+**Goal:** Follow-up to the 21:24 alignment diagnostic below -- separate two possible explanations for why pilot eval results leaned perceptual on every task (README's eval section): (a) genuine per-example arbitration that happens to favor perceptual more often (consistent with perceptual being the stronger baseline overall per the paper), vs. (b) the gate stuck near a fixed lean regardless of input content. Measured `gate_sym`/`gate_perc` (the actual per-layer router outputs from `JointGatedModulator`, sown via `self.sow("intermediates", ...)` inside the scanned action-expert stack) on real data from the trained `step-9999` checkpoint.
+
+**Setup:** `arm_d_dynamic_fusion/analysis/measure_gate_arbitration.py`, Modal A10G, `nour-mkawni`. 32 real pilot-training examples, one batch. Harder than the representation-alignment check because gate values only exist inside a `flax.linen` `nn.scan` and are only retrievable via `mutable=["intermediates"]` -- a mechanism `arm_d_pi0.ArmDModel.compute_loss`'s own docstring already flagged as unresolved through the `nnx_bridge` wrapper. Tried direct `mutable=` passthrough on the nnx-wrapped call first (failed on an unrelated keyword-arg name mismatch, `xs` vs. the wrapped module's actual parameter name `embedded` -- not a `mutable=` support problem, just an argument-naming one); fell back to extracting the wrapped `flax.linen.Module` (`ToNNX.module`) and its trained params directly (`nnx.state(wrapped).to_pure_dict()`) and calling `.apply(..., mutable=["intermediates"])` on it directly -- the same call shape `smoke_test.py`'s CHECK2 already proved works, just with real trained params/data. Succeeded.
+
+**Results:**
+| | gate_sym | gate_perc |
+|---|---|---|
+| Overall mean (18 layers x 32 examples) | 0.0000105 | 1.0000000 |
+| Overall std | 0.0000348 | 0.0000000 |
+| Per-layer mean, all 18 layers | every layer between 2e-8 and 1.4e-4 | (= 1 - gate_sym, by construction) |
+
+**Notes:** This is not "leans perceptual" -- it's full modality collapse. `gate_perc`'s standard deviation is exactly 0.0 across 32 real examples spanning a mix of the 4 Counting-suite tasks: the gate assigns ~100.00% weight to the perceptual stream and ~0.00% to the symbolic stream, uniformly, regardless of which task or example it's looking at. A genuinely arbitrating gate would show *some* example-to-example variance even if perceptual usually wins; zero variance means the router isn't reading its input at all in any way that matters -- it's a fixed switch, not an arbiter. This directly and fully explains BinFill's underperformance in the eval (37.3% vs. the paper's symbolic-only GroundSG+QwenVL getting 77.56% on that exact task): the gate has no way to ever express "trust symbolic here," regardless of what the input says. Combines with two things already known: (1) `random_init`'s gate is exactly uniform 0.5/0.5 by the zero-init design (confirmed in `smoke_test.py`), so this collapse happened entirely during the ~10k pilot training steps, not from initialization; (2) the load-balancing auxiliary loss meant to prevent exactly this failure mode (`JointGatedModulator`'s `balance_loss`) was never actually wired into `compute_loss`'s returned loss (README's "Scope of this pass" section, a known and previously-flagged gap) -- so there was no training-time counterpressure against collapse at all. The representation-alignment problem (21:24 entry) and this collapse are likely compounding, not independent: with zero alignment signal AND a ~15x scale advantage AND no anti-collapse loss, the router had every incentive to ignore the harder-to-use, quieter symbolic stream entirely and none to keep using it.
+
+**Decided next steps (updated from the 21:24 entry):** the shared-encoder + alignment-loss plan still stands for the representation-space problem, but is not sufficient alone -- wiring up the already-implemented but never-connected `balance_loss` into `compute_loss`'s training objective is now also necessary, not optional, since it's the specific mechanism designed to prevent the exact collapse just measured. Not yet started.
+
+---
+
+### 2026-08-28 21:24 — Arm D: symbolic/perceptual streams show zero representation alignment (pre-fusion diagnostic)
+**Tags:** #idea #baseline
+
+**Goal:** Supervisor flagged (2026-08-28 conversation with the user) that M_sym `[b, 64, 1024]` and M_perc `[b, 512, 1024]` should be unified into a shared representation space BEFORE any fusion mechanism is trusted -- same last-dim width isn't the same as living in the same semantic subspace, and nothing currently trains the two projectors toward each other (each only gets gradient through `JointGatedModulator`'s downstream flow-matching loss). Built `arm_d_dynamic_fusion/analysis/measure_representation_alignment.py` to quantify this directly on real data rather than guess.
+
+**Setup:** Modal, A10G, `nour-mkawni` account. Real pilot training data (`ArmDDataset`/`ArmDDataConfig`, same pipeline `launch_pilot_training.py` uses), 8 batches x 32 examples = 256 real examples, same batches (seed=42) fed to two model states, each in its own subprocess (see bugs below): `random_init` (fresh `ArmDConfig.create()`) and `trained_pilot_9999` (the published `Nkoni/arm-d-counting-suite-pilot` checkpoint). Metric: per-example mean-pooled M_sym/M_perc vectors, pairwise cosine similarity matrix per batch, matched (same example) vs. unmatched (shuffled) cosine similarity, and top-1 retrieval accuracy each direction vs. the 1/32 chance floor -- plus centroid cosine similarity and RMS-norm ratio as separate scale-mismatch checks.
+
+**Results:**
+| Condition | matched cos (mean±std) | unmatched cos (mean±std) | sym→perc acc | perc→sym acc | chance | centroid cos | sym RMS norm | perc RMS norm | norm ratio |
+|---|---|---|---|---|---|---|---|---|---|
+| random_init | 0.0238±0.0096 | 0.0238±0.0102 | 2.73% | 3.12% | 3.12% | 0.0264 | 13.18 | 117.06 | 0.113 |
+| trained_pilot_9999 | 0.0218±0.0006 | 0.0218±0.0006 | 3.12% | 3.12% | 3.12% | 0.0218 | 259.95 | 3781.99 | 0.069 |
+
+**Notes:** Matched and unmatched cosine similarity are statistically indistinguishable in BOTH conditions, and retrieval accuracy sits exactly at the chance floor for the trained checkpoint -- i.e. there is currently zero example-level correspondence signal recoverable between the two streams' pooled representations, before or after training. More strikingly, ~10k steps of ordinary downstream flow-matching loss did not improve this at all: the per-example variance in matched/unmatched similarity actually collapsed (std dropped ~15x, 0.0096->0.0006), meaning training pushed the pooled token representations toward a narrow, nearly example-independent direction rather than toward per-example alignment. Separately, there's a real and growing raw-scale mismatch: M_perc tokens are ~9x (random init) to ~15x (trained) larger in RMS norm than M_sym tokens, and this gap widens with training (perc norm grew ~32x vs. sym's ~20x over the same 10k steps) rather than closing. Confirms the supervisor's concern directly: same last-dim width is not a unified representation space, and whatever alignment mechanism gets built should probably address the scale mismatch too, not just direction/semantic alignment.
+
+**Bug fixed along the way:** first attempt built both the random-init and trained ~2.3B-param models in the same process/GPU context, one after another without releasing memory in between -- hit a real RESOURCE_EXHAUSTED OOM on the A10G's 24GB (rematerialization warnings, then a failed ~1GB allocation). Fixed by running each condition as its own subprocess (separate OS process = guaranteed clean GPU memory release between them). Also fixed two smaller bugs before that on the way to a working run: the image set `UV_PROJECT_ENVIRONMENT=/usr/local` (packages land on system Python) but the subprocess called a nonexistent `/app/.venv/bin/python`, copied from a different script's image convention that doesn't set that env var; and `BATCH_SIZE`/`NUM_BATCHES`/`SEED` were referenced inside the embedded analysis script's text but never actually substituted into it, causing a `NameError`.
+
+**Next step:** decide/build the actual unification mechanism (options discussed with the user: shared post-projection encoder, explicit alignment loss, or both) informed by these numbers -- not yet started.
+
+---
 
 ### 2026-08-24 17:15 — Arm D pilot eval: training complete, eval underway, paused mid-batch at 157/600
 **Tags:** #baseline #idea
