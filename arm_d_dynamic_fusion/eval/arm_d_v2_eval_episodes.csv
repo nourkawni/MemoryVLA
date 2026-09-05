@@ -1,4 +1,5 @@
 completed_at_utc,seed,task_id,episode_idx,success_flag,steps,checkpoint,dataset_split,action_space,max_steps_cap,timestamp_source
+2026-09-05T20:25:34+00:00,42,BinFill,19,success,1225,local:arm_d_pilot/counting-suite-content-conditional-fusion/9999,test,joint_angle,1300,recorded
 2026-09-05T20:25:12+00:00,0,BinFill,12,timeout,1301,local:arm_d_pilot/counting-suite-content-conditional-fusion/9999,test,joint_angle,1300,recorded
 2026-09-05T20:25:03+00:00,7,BinFill,19,fail,295,local:arm_d_pilot/counting-suite-content-conditional-fusion/9999,test,joint_angle,1300,recorded
 2026-09-05T20:23:50+00:00,7,BinFill,18,timeout,1301,local:arm_d_pilot/counting-suite-content-conditional-fusion/9999,test,joint_angle,1300,recorded
