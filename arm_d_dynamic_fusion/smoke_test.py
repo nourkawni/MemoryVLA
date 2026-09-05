@@ -10,7 +10,7 @@ dependent code path (joint_gated_modulator, history_gemma_dual, arm_d_pi0)
 actually runs and produces the shapes/behavior the design calls for, not to
 produce a trained or even sensible policy.
 
-Five independent checks, each printing its own PASS/FAIL marker so one
+Six independent checks, each printing its own PASS/FAIL marker so one
 failure doesn't hide the others:
   CHECK1 -- EarlyFusionModulator in isolation: attn_mass_sym + attn_mass_perc
             sums to 1 and both are in [0, 1] (true by construction --
@@ -45,6 +45,21 @@ failure doesn't hide the others:
             the mechanism CAN fully correct for the token-count imbalance
             (or fully favor symbolic, or perceptual) once training decides
             to, not a claim that it currently does (nothing is trained yet).
+  CHECK6 -- Content-conditional bias/tag modules (added 2026-09-04, see
+            joint_gated_modulator.py's module docstring): confirms the four
+            new Dense layers (tag_sym_proj/tag_perc_proj/bias_sym_proj/
+            bias_perc_proj) have the expected shapes, are exactly zero at
+            init (kernel AND bias), that a real forward pass through them
+            stays finite, that the bias lever's new plumbing still has the
+            same full [-10,10] -> [near-0,near-1] reach CHECK5 already
+            proved for the old scalar, and -- the one property the OLD
+            design structurally could not have -- that bias_sym_proj's own
+            Dense computation (tested in isolation, bypassing the full
+            attention/softmax pipeline to avoid confounding with the
+            pre-existing, non-zero-init q_einsum projection also fed by x)
+            produces IDENTICAL output for two different query vectors at
+            zero-init kernel, but DIFFERENT output once the kernel is
+            nonzero.
 
 Run with:
     modal run arm_d_dynamic_fusion/smoke_test.py::shape_and_gate_test
@@ -501,6 +516,139 @@ try:
 except Exception as e:  # noqa: BLE001
     import traceback
     _record("5_BIAS_LEVER_FULL_RANGE", False, f"{type(e).__name__}: {e}\\n{traceback.format_exc()}")
+
+# ---------------------------------------------------------------------------
+# CHECK6 -- content-conditional bias/tag modules (2026-09-04 architecture
+# change, see joint_gated_modulator.py's module docstring): shapes, exact-
+# zero-init, finiteness, the new plumbing's full reach (mirrors CHECK5), and
+# -- the one property the OLD design structurally could not have -- genuine
+# per-example differentiation, tested on bias_sym_proj's own Dense
+# computation in isolation (see (e) below for why: routing this through
+# attn_mass_sym would be confounded by the pre-existing, non-zero-init
+# q_einsum projection also fed by x).
+# ---------------------------------------------------------------------------
+try:
+    width = 1024
+    b, t, s_sym, s_perc = 2, 6, 8, 12
+    key = jax.random.key(30)
+    k_x, k_sym, k_perc, k_init = jax.random.split(key, 4)
+
+    x = jax.random.normal(k_x, (b, t, width))
+    mem_sym = jax.random.normal(k_sym, (b, s_sym, width))
+    mem_sym_mask = jnp.ones((b, s_sym), dtype=bool)
+    mem_perc = jax.random.normal(k_perc, (b, s_perc, width))
+    mem_perc_mask = jnp.ones((b, s_perc), dtype=bool)
+
+    efm = EarlyFusionModulator()
+    variables = efm.init(k_init, x, mem_sym, mem_sym_mask, mem_perc, mem_perc_mask)
+    params = variables["params"]
+
+    # (a) shapes
+    shapes_ok = (
+        params["tag_sym_proj"]["kernel"].shape == (width, width)
+        and params["tag_sym_proj"]["bias"].shape == (width,)
+        and params["tag_perc_proj"]["kernel"].shape == (width, width)
+        and params["tag_perc_proj"]["bias"].shape == (width,)
+        and params["mem_attn_fused"]["bias_sym_proj"]["kernel"].shape == (width, 1)
+        and params["mem_attn_fused"]["bias_sym_proj"]["bias"].shape == (1,)
+        and params["mem_attn_fused"]["bias_perc_proj"]["kernel"].shape == (width, 1)
+        and params["mem_attn_fused"]["bias_perc_proj"]["bias"].shape == (1,)
+    )
+
+    # (b) exact-zero-init -- kernel AND bias exactly 0.0 for all four new
+    # Dense layers, mathematically guaranteeing the content-conditional
+    # delta is exactly 0 for ANY input at init (CHECK1/CHECK5's unmodified
+    # assertions already re-verify the observable end-to-end consequence).
+    new_param_arrays = [
+        params["tag_sym_proj"]["kernel"], params["tag_sym_proj"]["bias"],
+        params["tag_perc_proj"]["kernel"], params["tag_perc_proj"]["bias"],
+        params["mem_attn_fused"]["bias_sym_proj"]["kernel"], params["mem_attn_fused"]["bias_sym_proj"]["bias"],
+        params["mem_attn_fused"]["bias_perc_proj"]["kernel"], params["mem_attn_fused"]["bias_perc_proj"]["bias"],
+    ]
+    exact_zero_init_ok = all(bool(jnp.all(arr == 0.0)) for arr in new_param_arrays)
+
+    # (c) finiteness of a real forward pass
+    modulated_x, stats = efm.apply(variables, x, mem_sym, mem_sym_mask, mem_perc, mem_perc_mask)
+    finite_ok = (
+        bool(jnp.all(jnp.isfinite(modulated_x)))
+        and bool(jnp.all(jnp.isfinite(stats["attn_mass_sym"])))
+        and bool(jnp.all(jnp.isfinite(stats["attn_mass_perc"])))
+    )
+
+    # (d) monotonic full-reach through the NEW plumbing -- overrides
+    # bias_sym_proj's bias (kernel stays 0), mathematically equivalent to
+    # CHECK5's direct override of the old bare scalar since the Dense's
+    # output is then the swept value everywhere, regardless of content.
+    def _with_bias_sym_proj_bias(variables, bias_value):
+        new_params = dict(variables["params"])
+        new_mem_attn = dict(new_params["mem_attn_fused"])
+        new_proj = dict(new_mem_attn["bias_sym_proj"])
+        new_proj["bias"] = jnp.array([bias_value], dtype=jnp.float32)
+        new_mem_attn["bias_sym_proj"] = new_proj
+        new_params["mem_attn_fused"] = new_mem_attn
+        return {"params": new_params}
+
+    bias_sweep = [-10.0, -4.0, 0.0, 4.0, 10.0]  # list[float]
+    attn_mass_sym_by_bias = []  # list[float]
+    for bias_value in bias_sweep:
+        swept_variables = _with_bias_sym_proj_bias(variables, bias_value)
+        _, swept_stats = efm.apply(swept_variables, x, mem_sym, mem_sym_mask, mem_perc, mem_perc_mask)
+        attn_mass_sym_by_bias.append(float(jnp.mean(swept_stats["attn_mass_sym"])))
+    monotonic_ok = all(
+        attn_mass_sym_by_bias[i] < attn_mass_sym_by_bias[i + 1] for i in range(len(attn_mass_sym_by_bias) - 1)
+    )
+    reaches_low_ok = attn_mass_sym_by_bias[0] < 0.05
+    reaches_high_ok = attn_mass_sym_by_bias[-1] > 0.95
+
+    # (e) per-example differentiation -- the property the OLD design
+    # structurally could not have. Tested on the new bias_sym_proj Dense in
+    # ISOLATION (a direct matmul, not routed through efm.apply()'s full
+    # attention/softmax pipeline) -- routing through attn_mass_sym instead
+    # (an earlier version of this check) is confounded: x also feeds
+    # q_einsum (a non-zero-init, pre-existing projection), so attn_mass_sym
+    # differs across examples with different x REGARDLESS of this new
+    # mechanism, purely from ordinary content-based attention. This isolated
+    # version can't have that confound -- it only ever touches
+    # bias_sym_proj's own params and x_normed.
+    #
+    # x_normed replicated by hand (MemoryRMSNorm's own formula, called with
+    # cond=None inside FusedMemoryAttention): rms-normalize then multiply by
+    # (1 + scale), scale zero-init so this is an exact match at init.
+    mem_rms_scale = params["mem_attn_fused"]["mem_rms_norm"]["scale"]  # jax.Array [width]
+    x_diff_query = jnp.stack([jnp.full((width,), 5.0), jnp.full((width,), -5.0)], axis=0)  # jax.Array [2, width] -- one query vector per "example"
+    var = jnp.mean(jnp.square(x_diff_query), axis=-1, keepdims=True)
+    x_normed_diff_query = (x_diff_query * jax.lax.rsqrt(var + 1e-6)) * (1 + mem_rms_scale)  # jax.Array [2, width]
+
+    bias_sym_proj_kernel = params["mem_attn_fused"]["bias_sym_proj"]["kernel"]  # jax.Array [width, 1], all 0.0 at init
+    bias_sym_proj_bias = params["mem_attn_fused"]["bias_sym_proj"]["bias"]  # jax.Array [1], 0.0 at init
+
+    delta_at_zero_kernel = x_normed_diff_query @ bias_sym_proj_kernel + bias_sym_proj_bias  # jax.Array [2, 1]
+    identical_at_zero_kernel_ok = bool(jnp.allclose(delta_at_zero_kernel[0], delta_at_zero_kernel[1], atol=1e-6))
+
+    nonzero_kernel = jnp.full((width, 1), 0.1, dtype=jnp.float32)
+    delta_at_nonzero_kernel = x_normed_diff_query @ nonzero_kernel + bias_sym_proj_bias  # jax.Array [2, 1]
+    differs_at_nonzero_kernel_ok = not bool(jnp.allclose(
+        delta_at_nonzero_kernel[0], delta_at_nonzero_kernel[1], atol=1e-3
+    ))
+    per_example_diff_ok = identical_at_zero_kernel_ok and differs_at_nonzero_kernel_ok
+
+    all_ok = (
+        shapes_ok and exact_zero_init_ok and finite_ok
+        and monotonic_ok and reaches_low_ok and reaches_high_ok
+        and per_example_diff_ok
+    )
+    _record(
+        "6_CONTENT_CONDITIONAL_MODULES",
+        all_ok,
+        f"shapes_ok={shapes_ok} exact_zero_init_ok={exact_zero_init_ok} finite_ok={finite_ok} "
+        f"monotonic_ok={monotonic_ok} reaches_low_ok={reaches_low_ok} reaches_high_ok={reaches_high_ok} "
+        f"attn_mass_sym_by_bias={dict(zip(bias_sweep, [round(v, 4) for v in attn_mass_sym_by_bias]))} "
+        f"identical_at_zero_kernel_ok={identical_at_zero_kernel_ok} "
+        f"differs_at_nonzero_kernel_ok={differs_at_nonzero_kernel_ok}",
+    )
+except Exception as e:  # noqa: BLE001
+    import traceback
+    _record("6_CONTENT_CONDITIONAL_MODULES", False, f"{type(e).__name__}: {e}\\n{traceback.format_exc()}")
 
 overall_ok = all(results.values())
 print("SMOKE_TEST_OVERALL_" + ("OK" if overall_ok else "FAIL"))

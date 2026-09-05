@@ -56,3 +56,24 @@ This diagnostic script already existed and was supposedly "already dispatched" b
 - This measures attention *mass* on the symbolic stream during a forward pass — it's a mechanistic signal, not a measurement of whether the model actually *uses* that content correctly. A model could look at the right stream and still act on it poorly.
 - Each task's 640 examples come from one contiguous ~2000-example window inside that task's block, not a random sample of the whole task's data across the dataset. If there's any drift in prompt style/difficulty within a task's block, this could bias the numbers slightly (though the checkpoint is fixed, so this mainly affects a task's internal variance, not the cross-task comparison).
 - Corresponds to `Nkoni/arm-d-v1` step 9999 only — this doesn't say anything about earlier/later checkpoints.
+
+## Follow-up (2026-09-05): re-run against the content-conditional redesign's checkpoint
+
+After the root-cause investigation found `bias_sym`/`bias_perc`/`tag_sym`/`tag_perc` were structurally forced into one global compromise value that different tasks pulled in conflicting directions (`RESEARCH_LOG.md`'s 2026-09-02 entries), all four were made content-conditional — a small per-layer Dense reads the query and adds a per-example delta on top of the existing value — and the model was retrained from scratch under this new architecture (10,000 steps, `EXP_NAME="counting-suite-content-conditional-fusion"`). This is the same test, re-run against that finished checkpoint (step 9999), reading directly off the private training volume rather than a published HF Hub repo.
+
+| Task | attn_mass_sym mean (new) | std (new) | n | attn_mass_sym mean (old checkpoint) |
+|---|---|---|---|---|
+| SwingXtimes | **0.8499** | 0.0205 | 640 | 0.4094 |
+| PickXtimes | 0.8386 | 0.0197 | 640 | 0.3850 |
+| BinFill | 0.8333 | 0.0245 | 640 | 0.4401 |
+| StopCube | 0.7726 | 0.0407 | 640 | 0.4180 |
+
+(All 4 windows again classified with zero mismatches/unclassified examples out of 640 each.)
+
+**Two things happened, and they point in different directions.**
+
+**First, a dramatic overall shift toward the symbolic stream** — every single task roughly doubled its symbolic attention share (from the 0.39–0.44 band to the 0.77–0.85 band). The per-task standard deviations also shrank (0.02–0.04, down from 0.05–0.07) — the model is now more *consistent* per task than before, not just shifted.
+
+**Second, the task-dependent ORDERING does not match the hypothesis.** BinFill was supposed to be the clear leader (needs the symbolic plan most); instead it's third of four, and **SwingXtimes — the task predicted to lean most *perceptual* — is now the highest of all four**. StopCube is the lowest, which is at least in the direction the hypothesis predicts, but SwingXtimes landing at the top directly contradicts it. The absolute spread across tasks is actually slightly *larger* now (0.077 vs. 0.055 before) — so the model is clearly making a bigger, more confident per-task distinction than before — it's just not the distinction the working hypothesis expected.
+
+**What this means:** the content-conditional redesign clearly changed something substantial — the model is no longer applying a flat, near-identical lean across tasks (which is what the fix targeted), and the per-task variance did shrink as hoped. But this isn't a clean confirmation of "BinFill needs symbolic, SwingXtimes/StopCube need perceptual" — if anything, SwingXtimes leaning most symbolic is a genuinely surprising result worth investigating further before treating this checkpoint as strictly better. It's possible the model learned a different, non-obvious task-dependent pattern (not necessarily wrong, just not the one we expected), or that the overall symbolic-ward shift is swamping whatever finer per-task signal exists. This diagnostic can't distinguish those on its own.

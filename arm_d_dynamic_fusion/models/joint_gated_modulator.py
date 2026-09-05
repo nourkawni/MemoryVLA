@@ -13,11 +13,35 @@ arm_d_dynamic_fusion/models/unified_memory_encoder.py, is a precondition for
 this design being meaningful at all -- concatenating two streams only makes
 sense once every token, regardless of stream, is measured in the same units).
 
-Mechanism, per action-expert layer:
-    M_sym_tagged  = M_sym  + tag_sym    (a learned "I am symbolic" vector, broadcast)
-    M_perc_tagged = M_perc + tag_perc   (a learned "I am perceptual" vector, broadcast)
+REVISED AGAIN 2026-09-04, per the user's explicit direction, after a week of
+diagnostics (RESEARCH_LOG.md's 2026-09-01/02 entries) found tag_sym/tag_perc/
+bias_sym/bias_perc all receive real, non-trivial per-step gradients (ruling
+out "the loss doesn't care about these params") that nonetheless conflict
+across the 4 Counting-suite tasks (bias sign agreement only 2/18 layers,
+~chance; tag pairwise cross-task cosine similarity 0.06-0.40, never close to
+a shared direction) -- explaining why all four sat essentially frozen near
+their random-init state across every saved checkpoint despite thousands of
+real training steps. As single GLOBAL, per-layer numbers, they were
+structurally forced to compromise across 4 tasks that want different things;
+those conflicting pushes cancel out on average instead of resolving to
+anything useful per example. Both mechanisms are now CONTENT-CONDITIONAL: a
+small zero-init Dense layer reads x/x_normed (the query -- the only
+causally-available content signal at this point; NOT r_fused, this
+attention's own output, which is produced FROM these very params and so
+can't be used to compute them without circularity) and adds a per-example
+(bias: per-example-and-per-query-token) delta on top of the existing global
+value. Zero-init on the new Dense layers guarantees the architecture is
+EXACTLY identical to the pre-2026-09-04 version at init -- training decides
+whether/how to use the new per-example freedom, nothing is forced. See
+bias_sym_delta's and tag_sym_delta's comments in FusedMemoryAttention/
+EarlyFusionModulator below for the exact mechanics.
+
+Mechanism, per action-expert layer (content-conditional deltas omitted here
+for brevity -- see the two classes' own docstrings/comments below):
+    M_sym_tagged  = M_sym  + tag_sym(x)    (a learned "I am symbolic" vector, now content-conditional)
+    M_perc_tagged = M_perc + tag_perc(x)   (a learned "I am perceptual" vector, now content-conditional)
     M_fused       = concat([M_sym_tagged, M_perc_tagged], axis=tokens)   -- ONE sequence
-    r_fused       = FusedMemoryAttention(x, M_fused, M_fused_mask)       -- ONE cross-attention
+    r_fused       = FusedMemoryAttention(x, M_fused, M_fused_mask)       -- ONE cross-attention, score bias now content-conditional too
     (scale, shift) = MLP(r_fused)                                       -- ONE modulation MLP
     s_hat         = (1 + scale) * Norm(x) + shift
 
@@ -29,15 +53,18 @@ one, plus the two additions described below that specifically address the
 64-token-symbolic-vs-512-token-perceptual imbalance:
 
 1. Modality tags (tag_sym/tag_perc, learned per-layer vectors added before
-   concatenation): let attention use "which stream is this token from" as a
-   content signal, not just each token's own features. Needed because after
-   concatenation, a token's position in the sequence no longer implies
-   anything on its own (attention has no innate sense of "the first 64
-   positions are one kind of thing") -- the tag is what makes stream identity
-   available to attention at all.
+   concatenation, plus a content-conditional per-example delta as of
+   2026-09-04 -- see above): let attention use "which stream is this token
+   from" as a content signal, not just each token's own features. Needed
+   because after concatenation, a token's position in the sequence no
+   longer implies anything on its own (attention has no innate sense of
+   "the first 64 positions are one kind of thing") -- the tag is what makes
+   stream identity available to attention at all.
 2. A learned per-stream score bias (bias_sym/bias_perc, two scalars per
-   layer), added to every symbolic/perceptual token's raw attention score
-   before the softmax that combines all 576 tokens. Necessary because a
+   layer, plus a content-conditional per-example-per-query-token delta as
+   of 2026-09-04 -- see above), added to every symbolic/perceptual token's
+   raw attention score before the softmax that combines all 576 tokens.
+   Necessary because a
    *plain* single softmax over 64 symbolic + 512 perceptual tokens has a
    structural bias toward whichever stream has more tokens: if the model
    can't yet distinguish relevant from irrelevant content (e.g. early in
@@ -190,13 +217,53 @@ class FusedMemoryAttention(nn.Module):
 
         # The new step: a learned per-stream additive bias, applied before
         # masking/softmax so it competes on equal footing with content-based
-        # scores rather than being layered on afterward. Zero-init: at step
-        # 0 this is a no-op and the attention is pure, unmodified content-
-        # based scoring, exactly as if this bias didn't exist.
+        # scores rather than being layered on afterward. Zero-init base
+        # scalar: at step 0 this is a no-op and the attention is pure,
+        # unmodified content-based scoring, exactly as if this bias didn't
+        # exist.
         bias_sym = self.param("bias_sym", nn.initializers.zeros_init(), (), jnp.float32)  # jax.Array [], float32
         bias_perc = self.param("bias_perc", nn.initializers.zeros_init(), (), jnp.float32)  # jax.Array [], float32
-        stream_bias = jnp.where(is_sym, bias_sym, bias_perc)  # jax.Array [b, s], float32
-        logits = logits + stream_bias[:, None, None, None, :]  # broadcasts over (num_kv_heads, group, t)
+
+        # CONTENT-CONDITIONAL delta (2026-09-04, see RESEARCH_LOG.md's
+        # 2026-09-02 gradient-conflict diagnostics): the base scalars above
+        # are a single number per layer, forced to compromise across all 4
+        # Counting-suite tasks -- confirmed via a real per-task gradient
+        # check to receive real, comparable-to-normal gradients each step,
+        # but in directions that conflict across tasks (bias sign agreement
+        # only 2/18 layers, ~chance), so the scalar sits frozen near its
+        # random-init value despite thousands of real training steps. This
+        # Dense reads x_normed -- the query, the only causally-available
+        # content signal at this point (NOT r_fused, this attention's own
+        # OUTPUT, which is produced FROM bias_sym/bias_perc and so cannot be
+        # used to compute them without circularity) -- so different examples
+        # (and hence different tasks) can now get a genuinely different bias
+        # instead of one forced global number. Zero-init kernel AND bias:
+        # the Dense's output is exactly 0.0 for any input at init, so
+        # bias_sym_bt/bias_perc_bt below are EXACTLY equal to the base
+        # scalar bias_sym/bias_perc at init -- not just close, identical --
+        # training decides whether/how to use the new per-example freedom.
+        bias_sym_delta = nn.Dense(
+            1, kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.zeros_init(),
+            dtype=x.dtype, name="bias_sym_proj",
+        )(x_normed)  # jax.Array [b, t, 1]
+        bias_perc_delta = nn.Dense(
+            1, kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.zeros_init(),
+            dtype=x.dtype, name="bias_perc_proj",
+        )(x_normed)  # jax.Array [b, t, 1]
+
+        bias_sym_bt = bias_sym + bias_sym_delta[..., 0].astype(jnp.float32)  # jax.Array [b, t], float32
+        bias_perc_bt = bias_perc + bias_perc_delta[..., 0].astype(jnp.float32)  # jax.Array [b, t], float32
+
+        # Was stream_bias = jnp.where(is_sym, bias_sym, bias_perc) -> [b, s]
+        # (varying only by memory position s, via is_sym). Now varies along
+        # BOTH t (query position, new -- content-conditional) and s (memory
+        # position, unchanged -- which stream this memory token belongs to).
+        stream_bias = jnp.where(
+            is_sym[:, None, :],        # jax.Array [b, 1, s]
+            bias_sym_bt[:, :, None],   # jax.Array [b, t, 1]
+            bias_perc_bt[:, :, None],  # jax.Array [b, t, 1]
+        )  # jax.Array [b, t, s], float32
+        logits = logits + stream_bias[:, None, None, :, :]  # was stream_bias[:, None, None, None, :] from a [b, s] array; now broadcasts (num_kv_heads, group) only, keeping the real t and s axes
 
         attn_mask = mem_mask[:, None, None, None, :]  # jax.Array [b, 1, 1, 1, s]
         masked_logits = jnp.where(attn_mask, logits, -2.3819763e38)
@@ -281,14 +348,38 @@ class EarlyFusionModulator(nn.Module):
         # Modality tags: give attention an explicit, cheap "which stream is
         # this" signal, since after concatenation a token's position alone
         # carries no such information. Small-random-init (not zero) is fine
-        # here -- unlike the bias below, these don't need to start inert:
+        # here -- unlike the bias above, these don't need to start inert:
         # the near-zero-init mlp_fused Dense below already guarantees the
         # whole modulator is an identity at init regardless of what these
         # tags contribute to the attention output.
         tag_sym = self.param("tag_sym", nn.initializers.normal(stddev=0.02), (width,), dtype)  # jax.Array [d]
         tag_perc = self.param("tag_perc", nn.initializers.normal(stddev=0.02), (width,), dtype)  # jax.Array [d]
-        mem_sym_tagged = mem_sym + tag_sym  # jax.Array [b, s_sym, d]
-        mem_perc_tagged = mem_perc + tag_perc  # jax.Array [b, s_perc, d]
+
+        # CONTENT-CONDITIONAL delta (2026-09-04, see bias_sym_delta's
+        # comment above for the full motivation -- the same cross-task
+        # gradient-conflict finding applies equally to tag_sym/tag_perc,
+        # confirmed via the same diagnostic: pairwise cross-task cosine
+        # similarity only 0.06-0.40 across all 6 task pairs, never close to
+        # a shared direction). mem_sym/mem_perc have no per-query-token axis
+        # (only a per-example one), so the per-example conditioning signal
+        # is a pooled summary of x rather than x itself -- mean over the
+        # query-token axis t, the natural per-example summary given no
+        # query-token mask is threaded into this call. Zero-init kernel AND
+        # bias, same exact-identity-at-init guarantee as the bias deltas.
+        x_pooled = jnp.mean(x, axis=1)  # jax.Array [b, d]
+        tag_sym_delta = nn.Dense(
+            width, kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.zeros_init(),
+            dtype=dtype, name="tag_sym_proj",
+        )(x_pooled)  # jax.Array [b, d]
+        tag_perc_delta = nn.Dense(
+            width, kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.zeros_init(),
+            dtype=dtype, name="tag_perc_proj",
+        )(x_pooled)  # jax.Array [b, d]
+
+        tag_sym_content = tag_sym + tag_sym_delta  # jax.Array [b, d] -- tag_sym [d] broadcasts against [b, d]
+        tag_perc_content = tag_perc + tag_perc_delta  # jax.Array [b, d]
+        mem_sym_tagged = mem_sym + tag_sym_content[:, None, :]  # jax.Array [b, s_sym, d]
+        mem_perc_tagged = mem_perc + tag_perc_content[:, None, :]  # jax.Array [b, s_perc, d]
 
         mem_fused = jnp.concatenate([mem_sym_tagged, mem_perc_tagged], axis=1)  # jax.Array [b, s_sym+s_perc, d]
         mem_fused_mask = jnp.concatenate([mem_sym_mask, mem_perc_mask], axis=1)  # jax.Array [b, s_sym+s_perc]

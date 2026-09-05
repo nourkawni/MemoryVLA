@@ -1,78 +1,49 @@
 """
-inspect_grad_sign_consistency.py
+inspect_grad_sign_consistency_fresh_arch.py
 
-Diagnostic (not training -- single backward passes, no optimizer update,
-no training loop): direct follow-up to inspect_grad_health.py's 2026-09-02
-finding, which surfaced a puzzle rather than resolving one. That script
-found tag_sym/tag_perc/bias_sym/bias_perc receive gradients COMPARABLE TO OR
-LARGER THAN mem_attn_fused's own q/kv projection weights on a single real
-batch -- not the near-zero-gradient "dead end" signature the earlier
-tag_health follow-up (2026-09-02, tags flat across all 5 saved checkpoints)
-would suggest. A real per-step gradient with essentially zero NET
-displacement over 8000 training steps points at a third possibility neither
-of the two original hypotheses covered: the gradient DIRECTION might be
-inconsistent across different batches/tasks (e.g. BinFill wanting the tag
-nudged one way, SwingXtimes wanting it nudged another), so updates cancel
-out on average across an epoch's worth of diverse tasks even though each
-individual step's gradient is real and non-trivial in magnitude. If true,
-that argues AGAINST a higher learning rate helping -- amplifying a
-zero-mean, high-variance signal just adds noise, it doesn't produce
-consistent net movement.
+Diagnostic (not training -- single backward passes, no optimizer update, no
+training loop, no checkpoint): gate 2 of the content-conditional bias/tag
+redesign's validation sequence (2026-09-04, joint_gated_modulator.py's
+module docstring -- see the "REVISED AGAIN 2026-09-04" note there for the
+full motivation). inspect_grad_sign_consistency.py found the OLD design's
+bias_sym/bias_perc/tag_sym/tag_perc -- single GLOBAL numbers/vectors per
+layer -- receive real gradients every step, but in directions that conflict
+across the 4 Counting-suite tasks (bias sign agreement only 2/18 layers,
+~chance; tag pairwise cross-task cosine similarity 0.06-0.40), explaining why
+those params sat frozen near random-init across every saved checkpoint. The
+fix replaced them with base param + zero-init Dense(query content) so
+different examples can get genuinely different values instead of one forced
+global compromise.
 
-This script tests that directly: runs ONE real backward pass (same
-mechanism as inspect_grad_health.py -- mirrors scripts/train.py's train_step
-exactly, no optimizer applied) per task, using the SAME 4 known-pure task
-windows measure_attn_mass_per_task.py established, one subprocess per task
-(consistent with this project's established OOM-avoidance pattern for
-repeated real forward/backward passes on this ~2.3B-param model). For
-bias_sym/bias_perc (scalar per layer), reports the raw signed gradient value
-per layer per task -- sign agreement/disagreement is directly readable. For
-tag_sym/tag_perc (1024-dim vector per layer), scalar sign doesn't apply to a
-direction -- instead reports the PAIRWISE COSINE SIMILARITY between each
-pair of tasks' gradient vectors at each layer: near +1 means the two tasks'
-gradients point the same way (consistent, would accumulate under more
-steps); near 0 or negative means they conflict/cancel.
+This script checks the new Dense KERNELS' cross-task gradient relationship
+on a FRESHLY-INITIALIZED (not trained) instance of the new architecture --
+no checkpoint exists yet for it, so this uses ArmDConfig.create(rng) (builds
+a model directly, bypassing train_config.weight_loader entirely) rather than
+loading a checkpoint. Reuses the SAME per-task backward-pass mechanism and
+the SAME 4 known-pure task windows measure_attn_mass_per_task.py established,
+one subprocess per task (this project's established OOM-avoidance pattern).
 
-Reading the result: consistently positive cross-task cosine similarities
-(and same-signed bias gradients across tasks) would mean the direction-
-inconsistency hypothesis is WRONG and the zero-net-movement puzzle needs a
-different explanation (worth then trying the LR experiment, since real,
-same-signed gradients not producing movement is a genuine dead-end signature
-of a DIFFERENT kind -- e.g. some other suppression mechanism). Mixed or
-negative cross-task cosine similarities / flipped bias signs would CONFIRM
-the direction-inconsistency hypothesis and argue against the LR experiment
-being useful on its own (a higher LR would need to be paired with something
-that reduces the noise, e.g. per-task/curriculum training, not just a bigger
-step size on the same noisy signal).
+IMPORTANT interpretive caveat, not just a coding detail: the old scalar/
+vector params had very few degrees of freedom (a bias is 1 number, a tag is
+1024 numbers), so low cross-task cosine similarity there really did mean
+"tasks are fighting over one shared number." A 1024x1024 kernel has vastly
+more degrees of freedom -- it's plausible for different tasks' gradients to
+look "conflicting" in raw flattened-cosine-similarity terms while the kernel
+still learns a mapping that serves all 4 tasks fine, since a matrix can move
+in different subspaces simultaneously in ways a scalar cannot. Treat this
+script's output as ONE supporting data point, not a decisive pass/fail test
+-- smoke_test.py's CHECK6 (structural reachability: CAN the mechanism
+produce different outputs for different examples at all) is the more
+decisive check, already passed. An ambiguous or unchanged result here is not
+itself a reason to abandon the fix.
 
-Role in the system: read-only analysis (4 gradient computations, no weights
-written anywhere), feeding the decision of whether a per-param-group LR
-experiment is worth running. robomme_policy_learning/ is not edited.
-
-UPDATED 2026-09-05 for the content-conditional bias/tag redesign: added the
-4 new Dense KERNEL paths (tag_sym_proj/tag_perc_proj/bias_sym_proj/
-bias_perc_proj) to TARGET_KEYS, alongside the still-present base params, so
-this can directly check whether the new architecture's actual trainable
-knob (the kernel, not the now-largely-vestigial base scalar/vector) shows
-less cross-task gradient conflict than the OLD design did -- see this
-file's own interpretive caveat below (a matrix's conflict metric is
-inherently softer evidence than a scalar's, given far more degrees of
-freedom) before treating this as a decisive test on its own; smoke_test.py's
-CHECK6 already gave the decisive structural proof (2026-09-04) that the new
-architecture CAN differentiate per example. Also added LOCAL_CHECKPOINT_STEP
-support (same convention measure_gate_arbitration.py established) to read
-the redesign's own just-finished checkpoint directly off the training
-volume. Switched from printing each subprocess's raw gradient arrays as
-JSON (safe for the small base params, but tag_sym_proj/tag_perc_proj are
-[18,1024,1024] each -- confirmed on inspect_grad_sign_consistency_fresh_
-arch.py, 2026-09-04, that printing arrays that size as JSON-over-stdout
-silently truncates/corrupts somewhere in the capture chain) to each
-subprocess saving a local .npz file instead, loaded and reduced to small
-cosine-similarity tables by the OUTER function -- never serializing a
-multi-million-element array as text.
+Role in the system: read-only analysis (4 gradient computations on a fresh,
+untrained model -- no weights written anywhere, no checkpoint touched),
+informing (not gating) the decision to proceed to a full retrain.
+robomme_policy_learning/ is not edited.
 
 Run with:
-    modal run arm_d_dynamic_fusion/analysis/inspect_grad_sign_consistency.py
+    modal run arm_d_dynamic_fusion/analysis/inspect_grad_sign_consistency_fresh_arch.py
 """
 
 import pathlib
@@ -84,18 +55,7 @@ POLICY_LOCAL_DIR = str(  # str
 )
 ARM_D_LOCAL_DIR = str(pathlib.Path(__file__).resolve().parent.parent)  # str, the arm_d_dynamic_fusion/ dir
 
-HF_CKPT_REPO = "Nkoni/arm-d-v1"  # str
-HF_CKPT_STEP = "9999"  # str
-
-# Set to an int to read a checkpoint directly off the training volume
-# instead of downloading from HF Hub -- same convention measure_gate_
-# arbitration.py established. Set 2026-09-05 to the content-conditional
-# redesign's just-finished run.
-LOCAL_CHECKPOINT_STEP: int | None = 9999  # int | None
-TRAIN_CONFIG_NAME = "arm_d_pilot"  # str, must match launch_pilot_training.py's own constant
-EXP_NAME = "counting-suite-content-conditional-fusion"  # str, ditto
-
-BATCH_SIZE = 4  # int, matches launch_pilot_training.py's real training batch_size (and inspect_grad_health.py's own choice)
+BATCH_SIZE = 2  # int, reduced from 4 -- batch_size=4 OOM'd on the A10G specifically for this fresh-init/create() path (2026-09-04): the checkpoint-loaded diagnostics fit fine at 4, but a freshly-initialized model's forward+backward doesn't get the same memory-efficient treatment restore_params' lazy load into target dtype/shape gets, and the new architecture adds ~37.7M params on top. Diagnostic-only (gradient DIRECTION across tasks), doesn't need real-training batch fidelity.
 SEED = 42  # int
 
 # Same 4 known-pure task windows measure_attn_mass_per_task.py established
@@ -107,15 +67,12 @@ TASK_WINDOWS = [  # list[tuple[str, int]]
     ("SwingXtimes", 160000),
 ]
 
-app = modal.App("robomme-arm-d-grad-sign-consistency")  # modal.App
+app = modal.App("robomme-arm-d-grad-sign-consistency-fresh-arch")  # modal.App
 
-ckpt_volume = modal.Volume.from_name("robomme-arm-d-eval-ckpt-cache", create_if_missing=True)  # modal.Volume, HF-downloaded checkpoints (used when LOCAL_CHECKPOINT_STEP is None)
+# No ckpt_volume -- this script never loads a checkpoint, only builds a
+# fresh random-init model.
 data_volume = modal.Volume.from_name("robomme-arm-d-pilot-data", create_if_missing=True)  # modal.Volume
-train_volume = modal.Volume.from_name("robomme-arm-d-pilot-training", create_if_missing=True)  # modal.Volume, launch_pilot_training.py's own checkpoints (used when LOCAL_CHECKPOINT_STEP is set)
-
-CKPT_VOLUME_PATH = "/ckpts"  # str
 DATA_VOLUME_PATH = "/pilot_data"  # str, must match launch_pilot_training.py's own constant
-TRAIN_VOLUME_PATH = "/pilot_training"  # str, must match launch_pilot_training.py's own constant
 
 image = (  # modal.Image
     modal.Image.debian_slim(python_version="3.11")
@@ -130,33 +87,9 @@ image = (  # modal.Image
         r"""sed -i 's/members = \["packages\/\*", "sandbox2\/flash_attn_jax"\]/members = ["packages\/*"]/' /app/pyproject.toml"""
     )
     .run_commands("cd /app && /root/.local/bin/uv sync --no-dev --python 3.11")
-    .run_commands("cd /app && /root/.local/bin/uv pip install --system pytest huggingface_hub")
+    .run_commands("cd /app && /root/.local/bin/uv pip install --system pytest")
     .add_local_dir(ARM_D_LOCAL_DIR, remote_path="/arm_d_root/arm_d_dynamic_fusion", copy=True)
 )
-
-
-@app.function(image=image, volumes={CKPT_VOLUME_PATH: ckpt_volume}, timeout=1800)
-def download_checkpoint() -> str:
-    """Downloads/unzips the published arm-d-v1 checkpoint (same logic as the other analysis scripts' download_checkpoint). Idempotent."""
-    import subprocess  # module
-
-    import huggingface_hub  # module
-
-    repo_dir = pathlib.Path(CKPT_VOLUME_PATH) / "arm-d-v1"  # Path
-    ckpt_dir = repo_dir / HF_CKPT_STEP  # Path
-    zip_path = repo_dir / f"{HF_CKPT_STEP}.zip"  # Path
-
-    if not zip_path.exists():
-        repo_dir.mkdir(parents=True, exist_ok=True)
-        huggingface_hub.hf_hub_download(
-            repo_id=HF_CKPT_REPO, repo_type="model", filename=f"{HF_CKPT_STEP}.zip",
-            local_dir=str(repo_dir),
-        )
-    if not ckpt_dir.exists():
-        subprocess.run(["python", "scripts/unzip_ckpt.py", str(repo_dir)], cwd="/app", check=True)
-
-    ckpt_volume.commit()
-    return str(ckpt_dir)
 
 
 ANALYSIS_SCRIPT = r'''
@@ -166,7 +99,6 @@ sys.path.insert(0, "/app/src")
 sys.path.insert(0, "/arm_d_root")
 
 import os
-import pathlib
 os.chdir("/app")
 
 import jax
@@ -175,7 +107,6 @@ import numpy as np
 import flax.nnx as nnx
 import flax.traverse_util
 
-import openpi.models.model as _model
 from openpi.training.data_loader import TorchDataLoader, transform_dataset
 from mme_vla_suite.models.config.utils import get_history_config
 from mme_vla_suite.models.integration.history_observation import HistAugObservation
@@ -193,9 +124,12 @@ START_IDX = int(sys.argv[2])  # int
 
 train_config = _build_train_config(num_train_steps=1)
 data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
-model = train_config.model.load(
-    _model.restore_params(pathlib.Path("{ckpt_dir}") / "params", dtype=jax.numpy.bfloat16)
-)
+
+# FRESH, untrained model -- ArmDConfig.create(rng) builds directly, bypassing
+# train_config.weight_loader (ArmDWarmStartWeightLoader) entirely. No
+# checkpoint exists yet for the new content-conditional architecture.
+k_model, k_loss = jax.random.split(jax.random.key(SEED))
+model = train_config.model.create(k_model)
 model.train()
 
 history_config = get_history_config(train_config.model.history_config)
@@ -219,9 +153,8 @@ def loss_fn(model, rng, observation, actions):
     chunked_loss, stats = model.compute_loss(rng, observation, actions, train=True)
     return jnp.mean(chunked_loss), stats
 
-rng = jax.random.key(SEED)
 diff_state = nnx.DiffState(0, train_config.trainable_filter)
-(loss, stats), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, rng, observation, actions)
+(loss, stats), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, k_loss, observation, actions)
 
 grads_dict = grads.to_pure_dict()
 flat_grads = flax.traverse_util.flatten_dict(grads_dict, sep="/")
@@ -242,10 +175,16 @@ if TARGET_KEYS["tag_sym_proj_kernel"] not in flat_grads:
 
 # Save raw arrays to a local file on the container's disk (shared across the
 # 4 subprocesses, since they all run inside the SAME container instance) --
-# NOT printed/JSON-serialized to stdout. See module docstring's 2026-09-05
-# update for why (tag_sym_proj_kernel/tag_perc_proj_kernel are ~18.9M floats
-# each; printing that as JSON silently truncated/corrupted on a prior
-# script, confirmed 2026-09-04).
+# NOT printed/JSON-serialized to stdout. tag_sym_proj_kernel/tag_perc_proj_
+# kernel are [18, 1024, 1024] each (~18.9M floats) -- printing that as JSON
+# text and round-tripping it through subprocess stdout capture + the Modal
+# CLI's own output streaming silently truncated/corrupted the JSON on a
+# first attempt (2026-09-04, confirmed: a 264KB captured log for 4 tasks x
+# 8 large arrays is far too small to be intact JSON of that size -- the
+# text was cut somewhere in the capture chain). Saving as .npz and letting
+# the OUTER Modal function (numpy-only, no JAX needed) load and reduce them
+# to small cosine-similarity tables avoids ever serializing multi-million-
+# element arrays as text.
 arrays = {label: np.asarray(flat_grads[key], dtype=np.float32) for label, key in TARGET_KEYS.items()}
 np.savez(f"/tmp/grad_{TASK_NAME}.npz", **arrays)
 print(f"TASK_DONE:{TASK_NAME} loss={float(loss):.6f}")
@@ -254,21 +193,28 @@ print(f"TASK_DONE:{TASK_NAME} loss={float(loss):.6f}")
 
 @app.function(
     image=image, gpu="A10G", timeout=3600,
-    volumes={CKPT_VOLUME_PATH: ckpt_volume, DATA_VOLUME_PATH: data_volume, TRAIN_VOLUME_PATH: train_volume},
+    volumes={DATA_VOLUME_PATH: data_volume},
 )
 def inspect_grads_per_task() -> str:
     """
     What it does:
-        Resolves the checkpoint (local training-volume path if
-        LOCAL_CHECKPOINT_STEP is set, else downloads from HF Hub), then runs
-        ANALYSIS_SCRIPT once per entry in TASK_WINDOWS -- each as its own
-        subprocess (fresh model load), same OOM-avoidance pattern
-        measure_attn_mass_per_task.py established. Each subprocess saves its
-        raw gradient arrays to a local .npz file (shared container disk)
-        rather than printing them (see module docstring's 2026-09-05 update
-        for why); this function then loads all 4 .npz files with numpy and
-        computes the cosine-similarity/sign-agreement tables itself,
-        returning only the small formatted text report.
+        Runs ANALYSIS_SCRIPT once per entry in TASK_WINDOWS -- each as its
+        own subprocess (fresh model construction, same random seed each
+        time so all 4 tasks' gradients come from the SAME init state), same
+        OOM-avoidance pattern measure_attn_mass_per_task.py established.
+        Each subprocess saves its raw gradient arrays to a local .npz file
+        (shared container disk, since all 4 subprocesses run inside this
+        SAME Modal function invocation) rather than printing them -- the
+        largest arrays here (tag_sym_proj_kernel/tag_perc_proj_kernel, [18,
+        1024, 1024] each) are far too large to safely round-trip through
+        JSON-over-stdout (confirmed: a first version of this script did
+        exactly that and silently truncated/corrupted the JSON somewhere in
+        the subprocess-stdout-capture -> Modal-CLI-stdout-streaming chain,
+        2026-09-04). This function then loads all 4 .npz files with numpy
+        (no JAX needed for this step) and computes the cosine-similarity/
+        sign-agreement tables itself, returning only the small formatted
+        text report -- never serializing a multi-million-element array as
+        text at any point.
 
     Returns:
         str -- the fully formatted report (sign-agreement table for the
@@ -286,20 +232,12 @@ def inspect_grads_per_task() -> str:
 
     import numpy as np  # numpy.ndarray
 
-    if LOCAL_CHECKPOINT_STEP is not None:
-        train_volume.reload()  # Volumes aren't live-synced into an already-running container
-        ckpt_dir = f"{TRAIN_VOLUME_PATH}/ckpts/{TRAIN_CONFIG_NAME}/{EXP_NAME}/{LOCAL_CHECKPOINT_STEP}"  # str
-    else:
-        ckpt_dir = download_checkpoint.remote()  # str
-        ckpt_volume.reload()
-
     script_text = (
         ANALYSIS_SCRIPT
-        .replace("{ckpt_dir}", ckpt_dir)
         .replace("{BATCH_SIZE}", str(BATCH_SIZE))
         .replace("{SEED}", str(SEED))
     )  # str
-    script_path = "/tmp/inspect_grad_sign_consistency.py"  # str
+    script_path = "/tmp/inspect_grad_sign_consistency_fresh_arch.py"  # str
     with open(script_path, "w") as f:
         f.write(script_text)
 
@@ -342,7 +280,7 @@ def inspect_grads_per_task() -> str:
             per_layer_cos = np.array(per_layer_cos)
             lines.append(f"{t1+' vs '+t2:<28}{per_layer_cos.mean():<20.4f}{per_layer_cos.min():<12.4f}{per_layer_cos.max():<12.4f}")
 
-    lines.append("=== BASE PARAMS (unchanged style, for reference against the original checkpoint's findings) ===")
+    lines.append("=== BASE PARAMS (unchanged style, for reference against the original checkpoint-based findings) ===")
 
     lines.append("\n--- bias_sym_base/bias_perc_base: signed gradient per layer per task ---")
     for label in ["bias_sym_base", "bias_perc_base"]:

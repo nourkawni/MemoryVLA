@@ -29,6 +29,25 @@ start_loader.WARM_START_FUSED_ATTENTION=False) -- both so it doesn't
 overwrite the stopped run's checkpoint (kept for reference/comparison) and so
 the two attempts stay clearly distinguishable by name.
 
+UPDATED AGAIN 2026-09-04 (content-conditional bias/tag redesign): a week of
+diagnostics against that no-warmstart run's finished checkpoint
+(RESEARCH_LOG.md's 2026-09-01/02 entries) found bias_sym/bias_perc/tag_sym/
+tag_perc -- single GLOBAL numbers/vectors per layer -- receive real,
+non-trivial gradients every step, but in directions that conflict across the
+4 Counting-suite tasks, so those pushes cancel out on average and the params
+sit frozen near their random-init state across every checkpoint despite
+thousands of real training steps. joint_gated_modulator.py's EarlyFusion
+Modulator/FusedMemoryAttention were revised (see that file's own "REVISED
+AGAIN 2026-09-04" docstring note) to make all four content-conditional: a
+small zero-init Dense reads the query and adds a per-example delta on top of
+the existing global value, so different examples can get genuinely different
+values instead of one forced compromise. Validated via smoke_test.py's new
+CHECK6 (2026-09-04, all 6 checks pass) before touching this file. EXP_NAME
+changed AGAIN to "counting-suite-content-conditional-fusion" for this next
+attempt, so it doesn't overwrite either prior run's checkpoint. Full design
+rationale: see the saved plan file (harmonic-waddling-clock.md) or
+RESEARCH_LOG.md's 2026-09-04 entries.
+
 Recipe, per the user's explicit choice for this budget-limited pilot: LoRA-
 adapt the 2B VLM backbone (paligemma_variant="gemma_2b_lora"), full-train the
 300M action expert and every memory/gating module (symbolic_mem_encoder,
@@ -80,7 +99,7 @@ ARM_D_LOCAL_DIR = str(pathlib.Path(__file__).resolve().parent.parent)  # str, th
 
 TRAIN_CONFIG_NAME = "arm_d_pilot"  # str, must match build_pilot_dataset.py's assets output path
 DATA_REPO_ID = "arm_d_pilot"  # str, ditto
-EXP_NAME = "counting-suite-early-fusion-no-warmstart"  # str, this run's own checkpoint-directory identity (ckpts/{TRAIN_CONFIG_NAME}/{EXP_NAME}) -- distinct from both the old-mechanism pilot's "counting-suite-pilot" and the stopped warm-started early-fusion attempt's "counting-suite-early-fusion", so neither gets overwritten
+EXP_NAME = "counting-suite-content-conditional-fusion"  # str, this run's own checkpoint-directory identity (ckpts/{TRAIN_CONFIG_NAME}/{EXP_NAME}) -- distinct from the old-mechanism pilot's "counting-suite-pilot", the stopped warm-started early-fusion attempt's "counting-suite-early-fusion", and the finished no-warmstart run's "counting-suite-early-fusion-no-warmstart" (the checkpoint all this week's diagnostics ran against, published as Nkoni/arm-d-v1), so none of them get overwritten
 
 app = modal.App("robomme-arm-d-pilot-training")  # modal.App
 

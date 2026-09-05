@@ -75,6 +75,13 @@ OOM'd at batch 63/400). This script reuses that same fix: one task's window
 runs as its own OS subprocess (fresh model load, guaranteed memory release
 on exit) rather than one big loop over all 4 tasks' batches.
 
+UPDATED 2026-09-05: added LOCAL_CHECKPOINT_STEP support (same convention
+measure_gate_arbitration.py already established) so this can read a
+just-finished local training-volume checkpoint directly, without needing to
+publish it to HF Hub first -- used to re-run this exact test against the
+content-conditional bias/tag redesign's finished checkpoint (RESEARCH_LOG.md's
+2026-09-04/05 entries) before deciding whether it's worth publishing at all.
+
 Role in the system: read-only analysis, the direct test of Arm D's central
 hypothesis for whichever checkpoint CHECKPOINT_STEP/EXP_NAME point at.
 robomme_policy_learning/ is not edited.
@@ -95,6 +102,18 @@ ARM_D_LOCAL_DIR = str(pathlib.Path(__file__).resolve().parent.parent)  # str, th
 HF_CKPT_REPO = "Nkoni/arm-d-v1"  # str
 HF_CKPT_STEP = "9999"  # str
 
+# Set to an int (a step list_checkpoints/check_checkpoints, launch_pilot_
+# training.py, shows as saved) to read that checkpoint directly off the
+# training volume instead of downloading a published HF Hub checkpoint --
+# same LOCAL_CHECKPOINT_STEP convention measure_gate_arbitration.py already
+# established. None falls back to the HF Hub path (HF_CKPT_REPO/STEP above).
+# Set 2026-09-05 to the content-conditional redesign's just-finished run --
+# not yet published to HF Hub (that's a later decision, once these
+# diagnostics confirm it's actually worth publishing).
+LOCAL_CHECKPOINT_STEP: int | None = 9999  # int | None
+TRAIN_CONFIG_NAME = "arm_d_pilot"  # str, must match launch_pilot_training.py's own constant
+EXP_NAME = "counting-suite-content-conditional-fusion"  # str, ditto
+
 BATCH_SIZE = 32  # int, examples per batch
 NUM_BATCHES = 20  # int, 640 examples per task window -- plenty now that each window is a known-pure block, not a blind scan
 SEED = 42  # int
@@ -112,11 +131,13 @@ TASK_WINDOWS = [  # list[tuple[str, int]]
 
 app = modal.App("robomme-arm-d-attn-mass-per-task")  # modal.App
 
-ckpt_volume = modal.Volume.from_name("robomme-arm-d-eval-ckpt-cache", create_if_missing=True)  # modal.Volume
+ckpt_volume = modal.Volume.from_name("robomme-arm-d-eval-ckpt-cache", create_if_missing=True)  # modal.Volume, HF-downloaded checkpoints (used when LOCAL_CHECKPOINT_STEP is None)
 data_volume = modal.Volume.from_name("robomme-arm-d-pilot-data", create_if_missing=True)  # modal.Volume
+train_volume = modal.Volume.from_name("robomme-arm-d-pilot-training", create_if_missing=True)  # modal.Volume, launch_pilot_training.py's own checkpoints (used when LOCAL_CHECKPOINT_STEP is set)
 
 CKPT_VOLUME_PATH = "/ckpts"  # str
 DATA_VOLUME_PATH = "/pilot_data"  # str, must match launch_pilot_training.py's own constant
+TRAIN_VOLUME_PATH = "/pilot_training"  # str, must match launch_pilot_training.py's own constant
 
 image = (  # modal.Image
     modal.Image.debian_slim(python_version="3.11")
@@ -328,7 +349,7 @@ print("PER_TASK_RESULT_JSON:" + json.dumps(result))
 
 @app.function(
     image=image, gpu="A10G", timeout=3600,
-    volumes={CKPT_VOLUME_PATH: ckpt_volume, DATA_VOLUME_PATH: data_volume},
+    volumes={CKPT_VOLUME_PATH: ckpt_volume, DATA_VOLUME_PATH: data_volume, TRAIN_VOLUME_PATH: train_volume},
 )
 def measure_per_task() -> list[dict]:
     """
@@ -350,8 +371,12 @@ def measure_per_task() -> list[dict]:
     import json
     import subprocess  # module
 
-    ckpt_dir = download_checkpoint.remote()  # str
-    ckpt_volume.reload()
+    if LOCAL_CHECKPOINT_STEP is not None:
+        train_volume.reload()  # Volumes aren't live-synced into an already-running container
+        ckpt_dir = f"{TRAIN_VOLUME_PATH}/ckpts/{TRAIN_CONFIG_NAME}/{EXP_NAME}/{LOCAL_CHECKPOINT_STEP}"  # str
+    else:
+        ckpt_dir = download_checkpoint.remote()  # str
+        ckpt_volume.reload()
 
     script_text = (
         ANALYSIS_SCRIPT

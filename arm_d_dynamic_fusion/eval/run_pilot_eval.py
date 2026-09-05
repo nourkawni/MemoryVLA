@@ -65,6 +65,16 @@ HF_CKPT_REPO = "Nkoni/arm-d-v1"  # str, public HF Hub model repo, no auth needed
 HF_CKPT_STEP = "9999"  # str
 HF_CKPT_LOCAL_NAME = "arm-d-v1"  # str, local cache subdirectory name -- independent of HF_CKPT_REPO's exact string so this checkpoint's cache never collides with the OLD "arm-d-counting-suite-pilot" checkpoint's cache on the same account/volume, even though both happen to be published at the same step number
 
+# UPDATED 2026-09-05: set to an int to eval a checkpoint directly off the
+# private training volume instead of downloading from HF Hub -- same
+# LOCAL_CHECKPOINT_STEP convention measure_gate_arbitration.py established.
+# Used for the content-conditional redesign's just-finished checkpoint,
+# never published to HF Hub (that's a later decision, once eval results
+# justify it). None falls back to the HF_CKPT_REPO/STEP path above.
+LOCAL_CHECKPOINT_STEP: int | None = 9999  # int | None
+TRAIN_CONFIG_NAME = "arm_d_pilot"  # str, must match launch_pilot_training.py's own constant
+EXP_NAME = "counting-suite-content-conditional-fusion"  # str, ditto
+
 # Eval protocol scope, vs. the paper / modal_reproduction/full_eval.py's reproduction
 # of the released FrameSamp+Modul checkpoint (that script's own SEEDS/NUM_EPISODES/
 # TASKS constants):
@@ -80,18 +90,43 @@ HF_CKPT_LOCAL_NAME = "arm-d-v1"  # str, local cache subdirectory name -- indepen
 # is still a deliberate cut: Arm D was only fine-tuned on the Counting suite (see
 # README's "Fairness caveat"), so evaluating it on the other 12 tasks wouldn't be a
 # meaningful comparison regardless of episode count.
-PILOT_TASKS = ["BinFill", "PickXtimes", "SwingXtimes", "StopCube"]  # list[str], the Counting suite
+#
+# UPDATED AGAIN 2026-09-05 (user's explicit request, content-conditional
+# redesign checkpoint): narrowed to just ["BinFill"] for now -- run one task,
+# look at the result, decide whether to spend eval compute on the next task,
+# rather than committing to the full 600-episode protocol on an unproven
+# checkpoint. Still 3 seeds x 50 episodes = 150 episodes for this one task,
+# matching the OLD checkpoint's exact per-task protocol density (BinFill
+# n=150, 37.3%, RESEARCH_LOG.md's 2026-08-25 entry) for a like-for-like
+# comparison. Add the next task's name back to this list (or run a fresh
+# single-task list) to continue -- each task gets its own results file
+# names, so nothing here is destructive to run again later with more tasks
+# added.
+PILOT_TASKS = ["BinFill"]  # list[str], narrowed from all 4 -- see note above
 SEEDS = [0, 42, 7]  # list[int], matches the paper / full_eval.py exactly
 NUM_EPISODES = 50  # int, matches the paper / full_eval.py exactly
 MAX_STEPS = 1300  # int, matches the paper / modal_reproduction/full_eval.py's convention
 
 app = modal.App("robomme-arm-d-pilot-eval")  # modal.App
 
-ckpt_volume = modal.Volume.from_name("robomme-arm-d-eval-ckpt-cache", create_if_missing=True)  # modal.Volume, local cache of the public HF checkpoint (this account's own -- created fresh wherever this runs; shared with the OLD checkpoint's cache, safe because HF_CKPT_LOCAL_NAME subdirectories keep them apart)
-results_volume = modal.Volume.from_name("robomme-arm-d-v1-eval-results", create_if_missing=True)  # modal.Volume, a NEW volume distinct from the OLD checkpoint's "robomme-arm-d-pilot-eval-results" -- see module docstring for why sharing it would be silently wrong
+ckpt_volume = modal.Volume.from_name("robomme-arm-d-eval-ckpt-cache", create_if_missing=True)  # modal.Volume, local cache of the public HF checkpoint (used when LOCAL_CHECKPOINT_STEP is None) -- this account's own, shared with the OLD checkpoint's cache, safe because HF_CKPT_LOCAL_NAME subdirectories keep them apart
+train_volume = modal.Volume.from_name("robomme-arm-d-pilot-training", create_if_missing=True)  # modal.Volume, launch_pilot_training.py's own checkpoints (used when LOCAL_CHECKPOINT_STEP is set)
+# NEW volume, distinct from "robomme-arm-d-v1-eval-results" (the OLD
+# no-warmstart checkpoint's results) -- reusing that one would be silently
+# wrong: run_batch_remote's resume logic treats any (seed, task_id,
+# episode_idx) already present as "done" and skips it, and that volume
+# already has 356/600 keys filled for a DIFFERENT checkpoint, which would
+# make this run under-count (or, for tasks it already covers, report 0
+# pending) against a checkpoint it never actually evaluated.
+results_volume = modal.Volume.from_name("robomme-arm-d-content-conditional-eval-results", create_if_missing=True)  # modal.Volume
 CKPT_VOLUME_PATH = "/ckpts"  # str
+TRAIN_VOLUME_PATH = "/pilot_training"  # str, must match launch_pilot_training.py's own constant
 RESULTS_VOLUME_PATH = "/results"  # str
-CKPT_DIR = f"{CKPT_VOLUME_PATH}/{HF_CKPT_LOCAL_NAME}/{HF_CKPT_STEP}"  # str
+CKPT_DIR = (  # str
+    f"{TRAIN_VOLUME_PATH}/ckpts/{TRAIN_CONFIG_NAME}/{EXP_NAME}/{LOCAL_CHECKPOINT_STEP}"
+    if LOCAL_CHECKPOINT_STEP is not None
+    else f"{CKPT_VOLUME_PATH}/{HF_CKPT_LOCAL_NAME}/{HF_CKPT_STEP}"
+)
 
 # --- Policy-serving image (JAX/openpi/mme_vla_suite + arm_d_dynamic_fusion side) ---
 policy_image = (  # modal.Image
@@ -225,7 +260,11 @@ def download_checkpoint() -> str:
     return str(ckpt_dir)
 
 
-@app.cls(image=policy_image, gpu="A10G", volumes={CKPT_VOLUME_PATH: ckpt_volume}, timeout=3600)
+@app.cls(
+    image=policy_image, gpu="A10G",
+    volumes={CKPT_VOLUME_PATH: ckpt_volume, TRAIN_VOLUME_PATH: train_volume},
+    timeout=3600,
+)
 class PolicyServer:
     """One warm container per distinct seed value (Modal routes calls with
     the same constructor arg to the same warm container when available) --
@@ -254,8 +293,13 @@ class PolicyServer:
         # committed since this mount was taken (needed even when
         # download_checkpoint DID already run elsewhere, since Modal
         # Volumes aren't live-synced into an already-running container).
-        download_checkpoint.remote()
-        ckpt_volume.reload()
+        # LOCAL_CHECKPOINT_STEP mode skips the HF download path entirely --
+        # just needs train_volume reloaded for the same live-sync reason.
+        if LOCAL_CHECKPOINT_STEP is not None:
+            train_volume.reload()
+        else:
+            download_checkpoint.remote()
+            ckpt_volume.reload()
 
         # num_train_steps is irrelevant for eval (only train_config.model/data
         # matter to create_arm_d_trained_policy) -- reusing the exact same
@@ -475,7 +519,11 @@ def run_one_episode(seed: int, task_id: str, episode_idx: int) -> dict:
     result = {  # dict
         "seed": seed, "task_id": task_id, "episode_idx": episode_idx,
         "success_flag": success_flag, "steps": count,
-        "checkpoint": f"{HF_CKPT_REPO}/{HF_CKPT_STEP}",
+        "checkpoint": (
+            f"local:{TRAIN_CONFIG_NAME}/{EXP_NAME}/{LOCAL_CHECKPOINT_STEP}"
+            if LOCAL_CHECKPOINT_STEP is not None
+            else f"{HF_CKPT_REPO}/{HF_CKPT_STEP}"
+        ),
         "dataset_split": "test",
         "action_space": "joint_angle",
         "max_steps_cap": MAX_STEPS,
@@ -578,7 +626,8 @@ def run_batch_remote(max_new_episodes: int = 40) -> dict:
     """
     import concurrent.futures  # module
 
-    download_checkpoint.remote()
+    if LOCAL_CHECKPOINT_STEP is None:
+        download_checkpoint.remote()
 
     existing = _load_existing_results()  # dict
     job_list = [  # list[tuple[int, str, int]]

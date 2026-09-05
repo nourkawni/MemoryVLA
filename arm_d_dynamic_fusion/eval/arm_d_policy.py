@@ -35,16 +35,37 @@ Two released-code gaps found by reading policy.py/policy_config.py directly:
    auto-detection entirely and uses the caller-supplied, already-correct
    history_config directly -- safer than depending on a sidecar file's
    presence at an arbitrary download location.
+
+UPDATED 2026-09-04 for the content-conditional bias/tag redesign (joint_
+gated_modulator.py): that change added 4 new Dense sub-modules (tag_sym_proj/
+tag_perc_proj/bias_sym_proj/bias_perc_proj) that any checkpoint trained
+BEFORE the change -- including the currently-published Nkoni/arm-d-v1 --
+doesn't have. model.load()'s strict pytree-structure equality check fails
+hard on that mismatch (confirmed via a real crash-looping Modal container
+while replaying eval episodes against Nkoni/arm-d-v1, see RESEARCH_LOG.md's
+2026-09-04 entry). Fixed the same way warm_start_loader.py already handles
+"checkpoint doesn't have this param" for training warm-starts: merge the
+checkpoint's raw params into a freshly-initialized model's own param tree
+first (openpi.training.weight_loaders._merge_params, missing_regex=".*") --
+matching keys load the checkpoint's real trained weights, any key the
+checkpoint doesn't have falls back to the fresh model's own init (zero-init
+for these 4 specific layers by design, so evaluating an OLD checkpoint this
+way is exactly equivalent to its original, pre-redesign behavior -- nothing
+about a genuinely older checkpoint's evaluation changes, this only stops a
+crash that had nothing to do with the checkpoint itself).
 """
 
 import pathlib
 
-import jax.numpy as jnp
+import flax.nnx as nnx
+import jax
+import numpy as np
 from typing_extensions import override
 
 import openpi.models.model as _model
 import openpi.transforms as transforms
 from openpi.training import checkpoints as _checkpoints
+from openpi.training.weight_loaders import _merge_params
 
 import mme_vla_suite.training.config as _config
 from mme_vla_suite.policies.policy import MME_VLA_Policy
@@ -159,9 +180,25 @@ def create_arm_d_trained_policy(
     Example output:
         an ArmDPolicy instance, ready for .reset()/.add_buffer()/.infer() calls.
     """
-    model = train_config.model.load(
-        _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16)
-    )  # ArmDModel
+    # Merge the checkpoint's raw params into a freshly-initialized model's
+    # own param tree BEFORE calling .load() -- see module docstring's
+    # "UPDATED 2026-09-04" note. A plain train_config.model.load(restore_
+    # params(...)) (the original one-line version) does a strict pytree-
+    # structure equality check that fails hard if the checkpoint predates
+    # an architecture change that added new params (exactly what happened
+    # loading the currently-published Nkoni/arm-d-v1 after the content-
+    # conditional bias/tag redesign). _merge_params keeps every checkpoint
+    # value that has a matching key in the fresh model (coercing dtype to
+    # match, same as this project's training warm-start path already does)
+    # and fills in anything the checkpoint doesn't have from the fresh
+    # model's own init -- exactly right for a genuinely-missing NEW param
+    # (falls back to that layer's designed init, e.g. zero-init), and a
+    # no-op for a checkpoint that already has everything (nothing to fill).
+    fresh_model = train_config.model.create(jax.random.key(seed))  # ArmDModel
+    fresh_params = nnx.state(fresh_model, nnx.Param).to_pure_dict()  # at.Params
+    loaded_params = _model.restore_params(checkpoint_dir / "params", restore_type=np.ndarray)  # at.Params
+    merged_params = _merge_params(loaded_params, fresh_params, missing_regex=".*")  # at.Params
+    model = train_config.model.load(merged_params)  # ArmDModel
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)  # DataConfig
     norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)  # dict[str, NormStats]
 

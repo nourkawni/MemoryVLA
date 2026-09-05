@@ -80,9 +80,9 @@ HF_CKPT_STEP = "9999"  # str
 # to read that in-progress run's checkpoint directly off the training
 # volume instead of downloading a published HF Hub checkpoint. None falls
 # back to the HF Hub path above.
-LOCAL_CHECKPOINT_STEP: int | None = 6000  # int | None
+LOCAL_CHECKPOINT_STEP: int | None = 2000  # int | None
 TRAIN_CONFIG_NAME = "arm_d_pilot"  # str, must match launch_pilot_training.py's own constant
-EXP_NAME = "counting-suite-early-fusion-no-warmstart"  # str, ditto -- updated 2026-08-30 to the attempt-2 (mem_attn_fused trained from scratch) run; the stopped attempt-1 run's checkpoint is still at "counting-suite-early-fusion" if ever needed for comparison
+EXP_NAME = "counting-suite-content-conditional-fusion"  # str, ditto -- updated 2026-09-05 to the content-conditional bias/tag redesign's run (standing collapse-verification gate, checked at step 2000 before letting it continue further); the prior no-warmstart run's finished checkpoint is still at "counting-suite-early-fusion-no-warmstart" (published as Nkoni/arm-d-v1) if ever needed for comparison
 
 BATCH_SIZE = 32  # int, examples per batch
 NUM_BATCHES = 8  # int, 256 examples total -- forward-only, cheap
