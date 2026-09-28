@@ -1,0 +1,124 @@
+# xf-framesamp-modul-xattn-symroute-cond-qfix.yaml
+#
+# XF + symbolic route + current-subgoal conditioning + q_proj FIX (2026-09-27). Identical to
+# xf-framesamp-modul-xattn-symroute-cond.yaml plus four `fusion` flags: open cross-event mask with a
+# learned own-event bias, task/now-aware fusion queries (QueryContext FiLM), a pre-gate target-grounding
+# loss that trains q/kv/out_proj directly, and event tags on frames + captions. Why: VideoUnmask stayed at
+# 34% after option B (the policy does not map the caption's target location onto the scene) and fusion
+# q_proj never left init. Warm-started from symroute_cond/6499.
+#
+# Original header of the copied file:
+#
+# xf-framesamp-modul-xattn-symroute-cond.yaml
+#
+# XF + SYMBOLIC ROUTE + CURRENT-SUBGOAL CONDITIONING ("option B", 2026-09-26). Identical to
+# xf-framesamp-modul-xattn-symroute.yaml plus `symbolic_route.subgoal_cond: true`: the open event's
+# token E_open + a full-resolution (y, x) code go through subgoal_cond.SubgoalConditioner and are ADDED
+# to the action expert's adaRMS conditioning (time embedding), which scales/shifts/gates every
+# action-expert norm. Why: the symroute run (1,500 steps) encoded the subgoal (aux 37-62%) but its
+# actions ignored caption content (caption swap <= 0.65%). Warm-started from symroute/1499.
+#
+# Original header of the copied file:
+#
+# xf-framesamp-modul-xattn-symroute.yaml
+#
+# XF + SYMBOLIC ROUTE (2026-09-23). Identical to xf-framesamp-modul-xattn.yaml (kept unchanged
+# so earlier runs stay reproducible) plus the `symbolic_route` block at the bottom: the action
+# expert reads symbolic memory [E; C] through its own cross-attention (history_gemma_xf.py) in
+# parallel with the released perceptual modulator reading F', and an auxiliary loss
+# (symbolic_aux_head.py) supervises it to read the current subgoal. No frame or caption dropout.
+# Why: measure_coord_usage.py showed the 8k XF policy ignored captions entirely (~0.2% action
+# change vs 34-45% for frames). See RESEARCH_LOG.md 2026-09-23.
+#
+# Original header of the copied file:
+#
+# XF's history_config: the released perceptual-framesamp-modul.yaml
+# (robomme_policy_learning/src/mme_vla_suite/models/config/robomme/
+# perceptual-framesamp-modul.yaml, copied verbatim below) plus symbolic_aux
+# (temporal-alignment-agent.md section 2) and fusion (gated-fusion-agent.md
+# section 2) blocks. Loaded via xf_config_utils.get_xf_history_config, not
+# the released get_history_config (see that file's docstring for why).
+
+budget: 512
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: frame_sampling
+
+# --- XF additions below ---
+
+symbolic_aux:
+  enabled: true
+  type: grounded_subgoal
+  in_prompt: false   # XF = memory only (v1). true = XF+P/B2 variants, deferred past v1.
+  event_memory: true
+
+fusion:
+  # Set from xf_subgoal_table_builder.py's REAL full-dataset coverage report (2026-09-19,
+  # all 1,307 verified episodes, not a sample): events_per_table max=11/p50=2/p99=9,
+  # caption_token_len max=19/p50=10/p99=18. Values below are real max + a small margin
+  # (not just p99+margin) for headroom against distribution shift/future data.
+  max_events: 14       # E_max
+  caption_len: 22       # L_c
+  caption_encoder: embed_tf
+  caption_encoder_layers: 2
+  xattn_layers: 2        # L
+  xattn_mask: same_event
+  xattn_gate: tanh_zero
+  # Initial value of the tanh gate scalars a_x/a_d. 0.0 is the original Flamingo-style
+  # "tanh_zero" (exact identity at init). CHANGED TO 0.1 on 2026-09-22 after the 18k run's
+  # fusion never engaged: with the gate at ~3e-4, out_proj's gradients measured 5e-11..1e-10,
+  # i.e. 100-200x BELOW AdamW's eps=1e-8, where Adam stops normalizing and the projection
+  # freezes (its norm was still 2.046 vs a 2.048 analytic init after 18,000 steps). Forcing the
+  # gate to 0.1 was measured to lift those gradients to 2e-8..3.6e-8 (2-3.6x ABOVE eps),
+  # restoring normal updates. Raising out_proj's init instead does NOT work -- Adam is
+  # approximately scale-invariant, so that scales the gate's gradient mean and std together and
+  # leaves the update unchanged. Perturbation to the warm start is ~3e-5 of the frame stream,
+  # the same order the 18k checkpoint already carried. Set back to 0.0 to ablate.
+  # See RESEARCH_LOG.md 2026-09-22 and XF_18k_eval/analysis/fusion_message_findings.md.
+  xattn_gate_init: 0.1
+  event_tokens: true
+  budget_mode: extend    # 512 + max_events. "fixed" (496+16) is ablation A9, deferred.
+  # Probability of quantizing a training sample's event boundaries onto the same 16-step chunk
+  # grid real eval-time inference is constrained to (subgoal_logger.snap_table_to_chunk_grid;
+  # temporal-alignment-agent.md's SNAP_BOUNDARIES_TO_CHUNK_GRID ablation). 0.5 is the spec's own
+  # suggested starting point; set to 0.0 to disable and always train on exact-to-step boundaries.
+  snap_boundaries_to_chunk_grid_prob: 0.5
+  # --- q_proj fix (fusion_xattn.py qfix path + fusion_grounding.py) ---
+  qfix: true                 # open mask + own-event bias + task-aware query FiLM + pre-gate grounding loss
+  own_event_bias_init: 2.0   # logit bonus for the frame's OWN event's caption tokens (starts near same-event)
+  # grounding loss weight: action loss ~0.006 at symroute_cond/6499; untrained 16-way CE ~ln16=2.77,
+  # so 0.005 starts it at ~0.014 -- comparable to, not dominating, the other terms.
+  grounding_weight: 0.005
+  event_tag: true            # shared per-event tag on frame tokens (via temporal alignment) + event/caption tokens
+
+# --- XF symbolic route (history_gemma_xf.py + symbolic_aux_head.py) ---
+symbolic_route:
+  enabled: true
+  # Weight of the auxiliary current-subgoal loss relative to the flow-matching loss. The
+  # warm-started action loss is ~0.02 (RESEARCH_LOG step-0 readings); untrained 123-way CE is
+  # ~4.8, so 0.01 starts the aux term at ~2x the action loss rather than ~24x (0.1 would risk
+  # pulling the action expert away from action prediction). Must be checked in the short run:
+  # the action loss must not rise.
+  aux_weight: 0.01
+  aux_coord_weight: 1.0   # weight of the L1 (y, x)/255 term inside the aux loss
+  aux_num_captions: 128   # > max caption_id (123 measured on all 1,307 tables); 0 = UNK, masked
+  # option B: add SubgoalConditioner(E_open, open-event coords) to the action expert's adaRMS cond
+  subgoal_cond: true
