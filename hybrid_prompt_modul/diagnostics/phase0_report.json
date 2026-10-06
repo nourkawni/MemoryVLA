@@ -1,0 +1,338 @@
+{
+  "tables_found": 1307,
+  "mapped": 1307,
+  "agreement": {
+    "exact_online": 1.0,
+    "exact_recorded": 0.7725,
+    "lower_online": 1.0,
+    "text_only_online": 1.0
+  },
+  "counts": {
+    "checked": 400,
+    "no_table": 0,
+    "no_interval": 0,
+    "exact_online": 400,
+    "exact_recorded": 309,
+    "lower_online": 400,
+    "text_only_online": 400
+  },
+  "tasks": {
+    "BinFill": {
+      "episodes": 100,
+      "events_min": 3,
+      "events_max": 9,
+      "terminal_captions": {
+        "press the button": 20
+      },
+      "terminal_step_share_mean": 0.257,
+      "fake_terminal_frac": {
+        "0.25": 0.393,
+        "0.4": 0.437
+      },
+      "example_sequence": [
+        "pick up the first red cube",
+        "put it into the bin",
+        "pick up the second red cube",
+        "put it into the bin",
+        "press the button"
+      ]
+    },
+    "ButtonUnmask": {
+      "episodes": 5,
+      "events_min": 2,
+      "events_max": 4,
+      "terminal_captions": {
+        "pick up the container that hides the blue cube": 1,
+        "pick up the container that hides the green cube": 3,
+        "pick up the container that hides the red cube": 1
+      },
+      "terminal_step_share_mean": 0.517,
+      "fake_terminal_frac": {
+        "0.25": 0.022,
+        "0.4": 0.02
+      },
+      "example_sequence": [
+        "press the button",
+        "pick up the container that hides the green cube",
+        "put down the container",
+        "pick up the container that hides the blue cube"
+      ]
+    },
+    "ButtonUnmaskSwap": {
+      "episodes": 92,
+      "events_min": 3,
+      "events_max": 5,
+      "terminal_captions": {
+        "pick up the container that hides the green cube": 8,
+        "pick up the container that hides the blue cube": 4,
+        "pick up the container that hides the red cube": 8
+      },
+      "terminal_step_share_mean": 0.34,
+      "fake_terminal_frac": {
+        "0.25": 0.061,
+        "0.4": 0.067
+      },
+      "example_sequence": [
+        "press the first button",
+        "press the second button",
+        "pick up the container that hides the blue cube",
+        "put down the container",
+        "pick up the container that hides the green cube"
+      ]
+    },
+    "InsertPeg": {
+      "episodes": 100,
+      "events_min": 2,
+      "events_max": 2,
+      "terminal_captions": {
+        "insert the peg from the left side": 10,
+        "insert the peg from the right side": 10
+      },
+      "terminal_step_share_mean": 0.584,
+      "fake_terminal_frac": {
+        "0.25": 0.032,
+        "0.4": 0.044
+      },
+      "example_sequence": [
+        "pick up the peg by grasping the far end",
+        "insert the peg from the left side"
+      ]
+    },
+    "MoveCube": {
+      "episodes": 100,
+      "events_min": 1,
+      "events_max": 2,
+      "terminal_captions": {
+        "hook the cube to the target with the peg": 7,
+        "place the cube onto the target": 7,
+        "close the gripper and push the cube to the target": 6
+      },
+      "terminal_step_share_mean": 0.678,
+      "fake_terminal_frac": {
+        "0.25": 0.032,
+        "0.4": 0.027
+      },
+      "example_sequence": [
+        "pick up the peg",
+        "hook the cube to the target with the peg"
+      ]
+    },
+    "PatternLock": {
+      "episodes": 52,
+      "events_min": 1,
+      "events_max": 6,
+      "terminal_captions": {
+        "move right": 5,
+        "move backward-right": 6,
+        "move left": 4,
+        "move forward": 1,
+        "move backward": 1,
+        "move forward-right": 2,
+        "move forward-left": 1
+      },
+      "terminal_step_share_mean": 0.53,
+      "fake_terminal_frac": {
+        "0.25": 0.075,
+        "0.4": 0.067
+      },
+      "example_sequence": [
+        "move right"
+      ]
+    },
+    "PickHighlight": {
+      "episodes": 100,
+      "events_min": 2,
+      "events_max": 6,
+      "terminal_captions": {
+        "pick up the highlighted cube, which is red": 5,
+        "pick up the second highlighted cube, which is green": 3,
+        "pick up the third highlighted cube, which is blue": 3,
+        "pick up the highlighted cube, which is green": 4,
+        "pick up the second highlighted cube, which is red": 1,
+        "pick up the second highlighted cube, which is blue": 1,
+        "pick up the third highlighted cube, which is red": 2,
+        "pick up the highlighted cube, which is blue": 1
+      },
+      "terminal_step_share_mean": 0.474,
+      "fake_terminal_frac": {
+        "0.25": 0.066,
+        "0.4": 0.074
+      },
+      "example_sequence": [
+        "press the button",
+        "pick up the highlighted cube, which is red"
+      ]
+    },
+    "PickXtimes": {
+      "episodes": 100,
+      "events_min": 3,
+      "events_max": 11,
+      "terminal_captions": {
+        "press the button to stop": 20
+      },
+      "terminal_step_share_mean": 0.226,
+      "fake_terminal_frac": {
+        "0.25": 0.432,
+        "0.4": 0.467
+      },
+      "example_sequence": [
+        "pick up the red cube for the first time",
+        "place the red cube onto the target",
+        "pick up the red cube for the second time",
+        "place the red cube onto the target",
+        "press the button to stop"
+      ]
+    },
+    "RouteStick": {
+      "episodes": 100,
+      "events_min": 1,
+      "events_max": 5,
+      "terminal_captions": {
+        "move to the nearest right target by circling around the stick clockwise": 6,
+        "move to the nearest right target by circling around the stick counterclockwise": 3,
+        "move to the nearest left target by circling around the stick clockwise": 6,
+        "move to the nearest left target by circling around the stick counterclockwise": 5
+      },
+      "terminal_step_share_mean": 0.486,
+      "fake_terminal_frac": {
+        "0.25": 0.083,
+        "0.4": 0.087
+      },
+      "example_sequence": [
+        "move to the nearest right target by circling around the stick clockwise"
+      ]
+    },
+    "StopCube": {
+      "episodes": 100,
+      "events_min": 3,
+      "events_max": 3,
+      "terminal_captions": {
+        "press the button to stop the cube on the target": 20
+      },
+      "terminal_step_share_mean": 0.24,
+      "fake_terminal_frac": {
+        "0.25": 0.545,
+        "0.4": 0.525
+      },
+      "example_sequence": [
+        "move to the top of the button to prepare",
+        "remain static",
+        "press the button to stop the cube on the target"
+      ]
+    },
+    "SwingXtimes": {
+      "episodes": 100,
+      "events_min": 5,
+      "events_max": 9,
+      "terminal_captions": {
+        "press the button": 20
+      },
+      "terminal_step_share_mean": 0.286,
+      "fake_terminal_frac": {
+        "0.25": 0.298,
+        "0.4": 0.348
+      },
+      "example_sequence": [
+        "pick up the red cube",
+        "move to the top of the right-side target for the first time",
+        "move to the top of the left-side target for the first time",
+        "move to the top of the right-side target for the second time",
+        "move to the top of the left-side target for the second time",
+        "put the red cube on the table",
+        "press the button"
+      ]
+    },
+    "VideoPlaceButton": {
+      "episodes": 31,
+      "events_min": 2,
+      "events_max": 2,
+      "terminal_captions": {
+        "place the cube onto the correct target": 20
+      },
+      "terminal_step_share_mean": 0.459,
+      "fake_terminal_frac": {
+        "0.25": 0.061,
+        "0.4": 0.057
+      },
+      "example_sequence": [
+        "pick up the cube",
+        "place the cube onto the correct target"
+      ]
+    },
+    "VideoPlaceOrder": {
+      "episodes": 100,
+      "events_min": 2,
+      "events_max": 2,
+      "terminal_captions": {
+        "place the cube onto the correct target": 20
+      },
+      "terminal_step_share_mean": 0.462,
+      "fake_terminal_frac": {
+        "0.25": 0.062,
+        "0.4": 0.066
+      },
+      "example_sequence": [
+        "pick up the cube",
+        "place the cube onto the correct target"
+      ]
+    },
+    "VideoRepick": {
+      "episodes": 100,
+      "events_min": 3,
+      "events_max": 7,
+      "terminal_captions": {
+        "press the button to finish": 20
+      },
+      "terminal_step_share_mean": 0.304,
+      "fake_terminal_frac": {
+        "0.25": 0.112,
+        "0.4": 0.124
+      },
+      "example_sequence": [
+        "pick up the correct cube for the first time",
+        "put it down",
+        "pick up the correct cube for the second time",
+        "put it down",
+        "press the button to finish"
+      ]
+    },
+    "VideoUnmask": {
+      "episodes": 38,
+      "events_min": 1,
+      "events_max": 3,
+      "terminal_captions": {
+        "pick up the container that hides the blue cube": 5,
+        "pick up the container that hides the green cube": 6,
+        "pick up the container that hides the red cube": 9
+      },
+      "terminal_step_share_mean": 0.87,
+      "fake_terminal_frac": {
+        "0.25": 0.003,
+        "0.4": 0.003
+      },
+      "example_sequence": [
+        "pick up the container that hides the blue cube"
+      ]
+    },
+    "VideoUnmaskSwap": {
+      "episodes": 89,
+      "events_min": 1,
+      "events_max": 3,
+      "terminal_captions": {
+        "pick up the container that hides the red cube": 6,
+        "pick up the container that hides the blue cube": 10,
+        "pick up the container that hides the green cube": 4
+      },
+      "terminal_step_share_mean": 0.692,
+      "fake_terminal_frac": {
+        "0.25": 0.006,
+        "0.4": 0.006
+      },
+      "example_sequence": [
+        "pick up the container that hides the green cube",
+        "put down the container",
+        "pick up the container that hides the red cube"
+      ]
+    }
+  }
+}

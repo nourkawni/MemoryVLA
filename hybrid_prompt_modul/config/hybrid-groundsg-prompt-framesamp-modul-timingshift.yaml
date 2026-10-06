@@ -1,0 +1,55 @@
+# hybrid-groundsg-prompt-framesamp-modul-timingshift.yaml
+#
+# Identical to hybrid-groundsg-prompt-framesamp-modul.yaml (same model, same memory settings)
+# plus the caption_shift block: the timing-shift caption augmentation (training only) that teaches
+# the hybrid to verify caption progress against its frame memory (RESEARCH_LOG.md 2026-10-06).
+# Rates agreed with the user after Phase 0: counting tasks 0.40 (StopCube 0.30, so a shown
+# "press" caption stays real more often than fake), doubled in the last 2 events; unmask families
+# 0.10; others 0.15. Kinds: next 35%, 2+ ahead 10%, jump to terminal 40% (counting only), previous 15%.
+# 2026-10-06 (after the 2,000-step pilot): BinFill 0.40 -> 0.30 and StopCube 0.30 -> 0.25, because the
+# pilot's logged fake-terminal shares were 0.55 and 0.53 (> the 0.5 cap); applies from the resume at
+# step 1999 onward (steps 0-1999 used the earlier rates).
+# Read only by this arm's code (training/caption_shift.py via hybrid_dataset.py).
+
+budget: 512
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: frame_sampling
+
+symbolic_in_prompt:
+  type: grounded_subgoal
+
+caption_shift:
+  enabled: true
+  p_counting: 0.40
+  p_unmask: 0.10
+  p_other: 0.15
+  p_overrides:
+    BinFill: 0.30
+    StopCube: 0.25
+  counting_tasks: [SwingXtimes, PickXtimes, BinFill, StopCube]
+  unmask_tasks: [VideoUnmask, VideoUnmaskSwap, ButtonUnmask, ButtonUnmaskSwap]
+  near_end_events: 2
+  near_end_multiplier: 2.0
+  share_early_one: 0.35
+  share_early_k: 0.10
+  share_terminal: 0.40
+  share_late_one: 0.15

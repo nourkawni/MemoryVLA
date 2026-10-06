@@ -1,0 +1,68 @@
+# symbolic-modulator-only.yaml
+#
+# History-representation config for the symbolic-as-modulator probe (see
+# ../models/symbolic_modulator_pi0.py's module docstring for what this is and
+# why it exists).
+#
+# IMPORTANT: representation_type is set to the literal "symbolic" here, NOT
+# "symbolic_modulator_only" (an earlier draft of this file used that custom
+# string). Reason: mme_vla_suite.training.dataset.RoboMMEDataset and
+# mme_vla_suite.training.config.ModelTransformFactory both natively support
+# representation_type=="symbolic" already -- RoboMMEDataset's "symbolic"
+# branch needs no mem_buffer at all ("symbolic memory does not need
+# mem_buffer", that class's own comment) and ModelTransformFactory's PI05
+# branch automatically wires symbolic_memory_type + doubles max_token_len
+# when it sees this exact string. Using the literal "symbolic" here means the
+# DATA pipeline (this yaml, RoboMMEDataConfig, RoboMMEDataset,
+# ModelTransformFactory, scripts/train.py's create_data_loader) needs ZERO
+# forking or monkeypatching -- unlike arm_b1_static_fusion/
+# arm_d_dynamic_fusion, which both need a custom Dataset subclass because
+# their "dual_symbolic_perceptual" representation_type has no native support.
+#
+# symbolic_modulator_pi0.SymbolicModulatorModel does NOT read this field for
+# its own routing decision, precisely so it can avoid HistoryPi0's hard-coded
+# "if representation_type=='symbolic': integration_type=None" special case --
+# see that file's module docstring for the decoupling (self.representation_type
+# is hardcoded to "symbolic_modulator_only" in Python, independent of what
+# this yaml's representation_type field says).
+#
+# Field set below matches robomme_policy_learning/src/mme_vla_suite/models/
+# config/robomme/symbolic-simple-subgoal.yaml (the released reference config
+# for plain symbolic memory) field-for-field, since RoboMMEDataset.__init__
+# reads memory_feature.img/pos/state, num_views, and streaming_obs_horizon
+# UNCONDITIONALLY whenever history_config is not None, even for
+# representation_type=="symbolic" (which never actually uses them at
+# runtime -- mem_buffer is None -- but still needs the fields present to
+# avoid an AttributeError at construction time).
+
+budget: 512
+num_views: 1
+token_per_image: 64
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+
+# The ONE thing that actually changes this probe's behavior vs. the released
+# symbolic-simple-subgoal.yaml: integration_type is "modulation", not
+# "context". Only read by symbolic_modulator_pi0.SymbolicModulatorModel
+# itself (compared against INTEGRATION_TYPE) -- neither RoboMMEDataset nor
+# ModelTransformFactory look at integration_type at all, only
+# representation_type, so this field has no effect on the data pipeline.
+integration_type: modulation
+memory_token_dim: 2048
+representation_type: symbolic
+
+symbolic_memory:
+  type: simple_subgoal # simple (ungrounded) subgoals; same choice B1/D's pilot uses, for a like-for-like comparison later

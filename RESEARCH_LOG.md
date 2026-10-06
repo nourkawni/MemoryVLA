@@ -70,6 +70,235 @@ Single table of the key numbers, updated as they come in. This is the table you'
 
 ## Log
 
+### 2026-10-06 ~15:50 — Timing-shift@6000 VideoUnmask check STOPPED by user at 11 episodes: 10/11 (old hybrid 12/13) — VideoUnmask NOT hurt
+**Tags:** #hybrid #timingshift #eval
+`modal app stop ap-7XWh1uZqKvwCPTN4LAFI12` on user request; nothing running on either account. Seed 0, QwenVL captions, (episode, outcome, steps): 1 success 109, 2 success 123, 3 success 275, 4 success 110, 5 success 103, 6 success 96, **7 fail 111**, 8 success 127, 9 success 145, 10 success 119, 11 success 363 → **10/11 = 90.9%** (old hybrid 12/13 = 92.3%; released GroundSG+QwenVL 11/12 here; paper 88.67). The only failure, ep7, is QwenVL naming the wrong container (`<90-91, 78>` vs oracle `<92, 137>`) — the same episode and same QwenVL error that failed the old hybrid and the GroundSG control. Episode 0 was dispatched but never recorded (raised and was left pending; not investigated — logs had rotated).
+**Timing-shift@6000 summary:** SwingXtimes 4/11 (old 0/13; all 4 successes in episodes where QwenVL's "press" was on time; premature-press episodes 0/7); VideoUnmask 10/11 (unchanged). Next idea (design only, not approved yet): persistent fake captions held over episode windows, matching QwenVL's 2-24-chunk premature "press".
+
+### 2026-10-06 ~15:15 — Timing-shift@6000: SwingXtimes batch STOPPED at 11/25 (user: follow recommendation) — 4/11; VideoUnmask 13-episode check LAUNCHED
+**Tags:** #hybrid #timingshift #eval
+`modal app stop ap-OCnpDY7LhpE6ha8L6sKOy5`; nothing running on either account afterwards. Final SwingXtimes (seed 0, QwenVL): ep0 success 452, ep1 fail 520, ep2 fail 353, ep3 fail 377, ep4 fail 761, ep5 success 349, ep6 success 345, ep7 fail 552, ep8 fail 361, ep9 success 511, ep10 fail 325 → **4/11 = 36%** (old hybrid 0/13). ep10: first QwenVL "press" @256 while oracle at "right 1st" → premature. Split: premature-press episodes **0/7**, on-time **4/4**.
+VideoUnmask check (does the reduced caption influence hurt the caption-dependent task?): `run_batch --target hybrid_timingshift --tasks VideoUnmask --max-new-episodes 13`, `--detach`, spawned `fc-01M48HP3E672A6HWM9CKQQG070`, app `ap-7XWh1uZqKvwCPTN4LAFI12`, verified running. Compare: old hybrid 12/13 (92.3%); GroundSG+QwenVL 88.67 paper / 11/12 this harness.
+
+### 2026-10-06 ~15:05 — Timing-shift@6000 SwingXtimes, first 10/25 episodes: 4/10 success (old hybrid 0/13) — via faster swing progress, NOT via resisting premature "press"
+**Tags:** #hybrid #timingshift #eval #analysis
+Batch `ap-OCnpDY7LhpE6ha8L6sKOy5` (eval account) still running. Seed 0, QwenVL captions. Per episode (outcome, end step, first QwenVL "press" step, oracle at that moment):
+ep0 success 448, press@368 oracle=press | ep1 fail 512, @464 oracle=right 3rd | ep2 fail 352, @272 right 2nd | ep3 fail 368, @320 right 3rd | ep4 fail 752, @368 left 2nd | ep5 success 336, @288 oracle=press | ep6 success 336, @240 oracle=press | ep7 fail 544, @320 left 2nd | ep8 fail 352, @320 right 1st | ep9 success 496, @432 oracle=press.
+**Split:** success when QwenVL's "press" was PREMATURE: **0/6** (old model 0/13); when on time: **4/4**. On-time rate 4/10 vs 0/13 (Fisher one-sided p ≈ 0.024 for 4/10 vs 0/13 successes).
+**Snowball hypothesis rejected:** QwenVL first out of sync with the oracle at median step 144 (new) vs 160 (old); share of queries in sync 52% vs 45%.
+**Mechanism found (oracle progress at fixed steps, position 1=right 1st ... 5=right 3rd, 50=put on table, 99=press):** step 240 old [2,1,1,4,2,2,2,1,3,1,2,1,2] vs new [3,2,3,3,3,50,99,4,1,3]; step 320 old [3,3,1,4,2,2,2,1,3,3,2,1,3] vs new [50,4,3,5,4,99,99,4,1,5]. The new policy swings faster/without stalling (old episodes often stuck at "right 1st" for 300+ steps), so in 4/10 it finished before QwenVL's "press" arrived. Interpretation (consistent with Phase 3's +1-ahead drop 72.6%→27.2%): it is less derailed by out-of-sync captions about WHICH target, but still obeys a premature terminal "press" (0/6).
+Per-episode files: `hybrid_prompt_modul/eval/hybrid_timingshift_s6000_qwenvl_episodes.{csv,jsonl}`.
+
+### 2026-10-06 ~13:47-14:00 — Timing-shift@6000 published + smoke test PASS; SwingXtimes eval LAUNCHED (25 eps, QwenVL captions)
+**Tags:** #hybrid #timingshift #eval
+Upload (`upload_checkpoint_detached --step 6000 --variant timingshift`, `fc-01M48CXJKXWW3TW6713HK23NND`): HF `Nkoni/hybrid-groundsg-prompt-framesamp-modul-timingshift` has `6000.zip` = 6,673,736,038 bytes and `history_config.txt` = 884 bytes (contains caption_shift; BinFill 0.3 / StopCube 0.25). New eval target `hybrid_timingshift` (TS_STEP=6000; built with the timingshift yaml; own results volume `hybrid-timingshift-s6000-qwenvl-eval-results`).
+Smoke test (eval account): `history_config.txt matches the build config`; `[eval-load] 71 params from checkpoint, 0 fresh, 0 unused`; policy on L4 finite [16, 8]; caption change on the synthetic scene → **1.39%** action change (base hybrid 2.48%, released GroundSG 3.39% on the same scene — consistent with a less caption-driven policy; above the 0.1% "wired" threshold); QwenVL OK.
+Batch: `run_batch --target hybrid_timingshift --tasks SwingXtimes` with `--detach`, spawned `fc-01M48DQ6GGN5W9FPZNCE81ZTF2`, app `ap-OCnpDY7LhpE6ha8L6sKOy5`, verified `ephemeral (detached)`; 25 dispatched. Baseline to beat: base hybrid 0/13 on SwingXtimes (anchors: FrameSamp+Modul 92.00, GroundSG+QwenVL 7.33).
+
+### 2026-10-06 13:40 — Timing-shift run STOPPED at 6,000 by user instruction; pilot checkpoints 1000/1999 were PRUNED by the resume
+**Tags:** #hybrid #timingshift #training #infra
+User: "stop at 6k, save it, then eval only SwingXtimes". At 13:40 `check_checkpoints --variant timingshift` showed [2000, 4000, 6000] (visible from a separate container => committed); `modal app stop ap-ZeTkBZnf5kZ59D3DSqLVsV` issued; nothing running; step-6000 dir intact (params/, assets/, _CHECKPOINT_METADATA). Local watcher task stopped.
+**Unexpected loss (my oversight):** the pilot's checkpoints 1000 and 1999 no longer exist. Resuming in the same exp dir with keep_period=2000 made the released checkpoint manager prune steps that are not multiples of 2000. Step 2000 ≈ pilot + 1 step, so nothing material is lost and the Phase 3 numbers (measured on 1999 before the resume) stand. Lesson: before resuming, copy or note checkpoints that the new keep_period would prune.
+**What differs from the base hybrid (for attribution):** same model/data/actions/recipe; only the shown caption is shifted for a share of samples. Side differences: continued from base@9999 (so +6k steps vs base — no "+6k steps without shifts" control exists); optimizer moments reset + 500-step lr re-warmup at the 1999 resume; BinFill/StopCube rates lowered at 1999. Evidence the effect is the shifting rather than extra steps: in the base run, steps 2000→9999 lowered frame-swap 9.3%→6.3%; the shifted pilot raised it to 13.6% within 2,000 steps and cut swing-end caption-ahead sensitivity 72.6%→27.2%.
+
+### 2026-10-06 12:30 — Timing-shift Phase 4: RESUMED to 10,000 steps (first resume in this arm — verified clean); BinFill/StopCube rates lowered
+**Tags:** #hybrid #timingshift #training
+User chose plan A (continue to 10k, then one eval). Yaml change before resuming: p_overrides BinFill 0.40→0.30, StopCube 0.30→0.25 (pilot fake-terminal 0.55/0.53 > 0.5 cap); steps 0-1999 used the old rates. Launched `run_training --variant timingshift --num-train-steps 10000 --resum-ckpt-id 1999 --save-interval 2000 --batch-size 4`, `--detach`, spawned `fc-01M488TJ5H07E2Y5KNQ93AYEQP`, app `ap-ZeTkBZnf5kZ59D3DSqLVsV`, verified `ephemeral (detached)`.
+**Resume path verified (first use, per the test-both-paths rule):** `[load trained hybrid checkpoint (resume/diagnostics)] 71 params from checkpoint, 0 fresh-initialized, 0 unused`. Released resume semantics: params reloaded from step 1999, step counter continues at 1999, optimizer moments re-initialized (checkpoints hold no optimizer state), lr warmup repeats. Run's `history_config.txt` (read from the volume) shows BinFill 0.3 / StopCube 0.25. At 12:38: step 2,200, ~1.1 it/s, ETA ~2 h; losses steps 2140-2200: 0.0027/0.0035/0.0032/0.0021.
+
+### 2026-10-06 — Timing-shift PHASE 3 PASS: premature-caption sensitivity near SwingXtimes end down 63-72%, frame effect x2.1, captions still large
+**Tags:** #hybrid #timingshift #diagnostic
+`check_routes --mode trained --variant timingshift --step 1999 --swing-ahead` (A10G; base data config, caption shifting OFF). Load 71/0 fresh/0 unused. Same samplers/seeds as the 9999 baseline (16 SwingXtimes last-swing samples after 768 draws; mixed batch n=16).
+
+| intervention | before: base@9999 (mean / max) | after: timingshift@1999 (mean / max) |
+|---|---|---|
+| floor | 0.000% / 0.000% | 0.000% / 0.000% |
+| caption swap | 38.633% / 121.077% | 28.331% / 127.657% |
+| frame swap | 6.341% / 33.506% | 13.607% / 73.170% |
+| swing_end: caption +1 ahead | 72.610% / 163.823% | **27.168%** / 105.749% |
+| swing_end: caption -> terminal (press) | 55.897% / 111.689% | **15.878%** / 109.349% |
+
+**Pass criteria (plan):** swing_end rows shrink clearly (−63% / −72%) ✓; caption swap stays large (28%) ✓; frame swap grows (×2.1) ✓. **Caveats:** n=16; maxima ~105-109% → some samples still follow a premature caption; caption-swap drop (−27%) → watch VideoUnmask in eval. Mechanistic change only; task success needs the eval.
+
+### 2026-10-06 11:41-12:19 — Timing-shift PILOT COMPLETE (2,000 steps): loss back to base level; shift stats show BinFill/StopCube over the fake-terminal cap
+**Tags:** #hybrid #timingshift #training
+App `ap-rT2GWzZb1LMD1XPIihYF8t` stopped on its own 12:19; saved steps [1000, 1999] (exp `...-timingshift`). 2,000 steps in 33:29 (~1.0 it/s). Single-batch losses: step 0 0.0439 → steps 1720/1800/1880/1960: 0.0018/0.0032/0.0045/0.0032 (base model ended ~0.003-0.004), i.e. the shifted samples are being fit.
+**Caption-shift stats (one DataLoader worker, first 2,000 samples):** SwingXtimes shifted 29.2% of 216, fake-terminal 0.33 (22/66); PickXtimes 24.8% of 246, 0.33 (25/76); **BinFill 32.2% of 286, 0.55 (48/87)**; **StopCube 27.3% of 139, 0.53 (23/43)**; VideoRepick 8.4%, 0.12; VideoUnmask 0.0% of 25; VideoUnmaskSwap 0.0% of 80; ButtonUnmaskSwap 3.6%; others 1.8-6.2%. Many draws were blocked (impossible kind), so effective rates < nominal. no_match (shown caption not in the timeline — recorded-view captions whose coordinates differ from the online timeline): PickHighlight 30/163, PickXtimes 26/246, BinFill 9/286, SwingXtimes 9/216 — left unshifted (safe).
+**Notes for any longer run:** BinFill and StopCube exceed the 0.5 fake-terminal cap (sim predicted 0.44/0.53) → lower BinFill p to ~0.30, StopCube to ~0.25; consider matching coordinate-stripped text to recover no_match samples. Next: Phase 3 check_routes on step 1999 (awaiting user OK).
+
+### 2026-10-06 11:32-11:41 — Timing-shift fix, PHASE 2 steps 2-3: tentative PASS; 2,000-step pilot LAUNCHED
+**Tags:** #hybrid #timingshift #tentative #training
+**Tentative** (`run_tentative_detached --variant timingshift`, app `ap-1ywWHW9Eh02fWJF5WSWmp6`, spawned `fc-01M485EJ303RD4HC8AH36SX7WV`, A10G, batch 4, exp `...-timingshift-tentative`): warm start `.../hybrid-groundsg-prompt-framesamp-modul/9999/params`; `[caption_shift] loaded 1307 timelines` with the agreed ShiftConfig; merge 71 params from checkpoint, 0 fresh, 0 unused; XLA rematerialization estimate ~15 GiB (as base); **Step 0: grad_norm=0.2009, llm_grad_norm=0.1330, loss=0.0439, mem_enc_norm=0.0021, param_norm=1870.04**; "Tentative run completed", app stopped 11:40. Step-0 loss 0.0439 vs ~0.003-0.004 at the end of base training: expected — the base model obeys the shifted captions and mispredicts those samples (the training signal).
+**Pilot launched 11:41:** `run_training --variant timingshift --num-train-steps 2000 --save-interval 1000 --batch-size 4`, `--detach`, spawned `fc-01M485ZBW5JYFMCKVC4X6REX2N`, app `ap-rT2GWzZb1LMD1XPIihYF8t`, verified `ephemeral (detached)`; exp `hybrid-groundsg-prompt-framesamp-modul-timingshift` (fresh, overwrite guard passed). Checkpoints expected at 1000 and 1999. ~1.2 h at the base run's ~0.47 it/s.
+
+### 2026-10-06 — Timing-shift fix, PHASE 2 step 1: BEFORE baseline check_routes on hybrid@9999 (with new --swing-ahead rows)
+**Tags:** #hybrid #timingshift #diagnostic #baseline
+`check_routes --mode trained --step 9999 --swing-ahead` (training account, A10G; variant base). Load: 71 params from checkpoint, 0 fresh, 0 unused. Swing-ahead sampler: 16 SwingXtimes last-swing samples (k in n-4..n-3) after 768 random draws. Mixed batch n=16; swing rows n=16.
+
+| intervention | mean | max |
+|---|---|---|
+| floor | 0.000% | 0.000% |
+| caption swap | 38.633% | 121.077% |
+| frame swap | 6.341% | 33.506% |
+| swing_end: caption +1 ahead | **72.610%** | 163.823% |
+| swing_end: caption -> terminal (press) | **55.897%** | 111.689% |
+
+**Reading:** near the end of SwingXtimes a premature caption moves actions 56-73% — the policy obeys it (numerical confirmation of the 13/13 eval failure mode). Frame-swap effect fell from 9.3% (step 2000) to 6.3% (step 9999): ordinary training weakened the frame route further. These two swing_end rows are the Phase 3 targets (must shrink after the fine-tune; caption swap must stay large; frame swap should grow).
+
+### 2026-10-06 — Timing-shift fix, PHASE 1 done (local code + tests, $0)
+**Tags:** #hybrid #timingshift #phase1
+Rates agreed by user after Phase 0: counting 0.40 (StopCube 0.30), doubled in last 2 events; unmask 0.10; other 0.15; kinds next 35% / 2+ ahead 10% / terminal 40% (counting only, else 2+ ahead) / previous 15%; impossible kind = no shift; never shift to/from "... that hides the ..." captions; position found from the caption the sample shows (nearest occurrence for repeats). User skipped 0.4 (oracle eval).
+**Files:** new `training/caption_shift.py` (pure-Python logic + ShiftStats incl. fake-terminal share); `training/hybrid_dataset.py` (caption_shift OFF by default; `load_episode_timelines()` loads all 1,307 tables once; order: online/recorded pick -> shift -> ±8 px noise; per-worker stats every 2,000 samples); new `config/hybrid-groundsg-prompt-framesamp-modul-timingshift.yaml`; `training/launch_hybrid_training.py` `--variant base|timingshift` (timingshift: exp `hybrid-groundsg-prompt-framesamp-modul-timingshift`, warm start base/9999 with zero fresh params, HF repo `Nkoni/hybrid-groundsg-prompt-framesamp-modul-timingshift`; base unchanged and default); `diagnostics/check_routes.py` `--variant` + `--swing-ahead` (16 SwingXtimes last-swing samples: true vs +1-ahead vs terminal caption; data pipeline always base config); new `tests/test_caption_shift.py`. Removed the half-built `hybrid_oracle` eval target.
+**Verified locally:** `pytest hybrid_prompt_modul/tests` 17/17 pass (neighbour choice per kind, in-range, impossible -> blocked, terminal only in counting tasks, target-naming never shifted, trigger rates within ±0.01 of 0.40/0.80/0.30/0.15/0.10, untriggered keeps true caption, repeated captions -> nearest, yaml off by default + typo/share-sum errors, fake-terminal accounting); ruff F/E9 clean.
+**NOT verified (needs Modal):** dataset change on real tables inside the training image, the variant warm start, `--swing-ahead` path.
+
+### 2026-10-06 — Timing-shift fix, PHASE 0 done (CPU, read-only): XF subgoal tables match training captions 400/400; per-task sequences; fake-terminal ratios
+**Tags:** #hybrid #timingshift #phase0
+Script `hybrid_prompt_modul/diagnostics/phase0_tables.py` (Modal CPU, training account; first run crashed on my own bug — epis_idx stored as 1-element array — fixed). Report saved `hybrid_prompt_modul/diagnostics/phase0_report.json`.
+**0.1** 1,307/1,307 mapped episodes have `subgoal_table.json`. 400 random samples from 416,950 data/*.pkl: table caption at the sample's step == sample's `grounded_subgoal_online` **400/400 exact** (text + coordinates); == recorded `grounded_subgoal` 309/400 (77.3%, expected: online switches earlier). Implementation note: shifts must be counted from the caption the sample SHOWS (recorded can lag the table by one interval).
+**0.2** events per episode / terminal caption / terminal share of execution steps: SwingXtimes 5-9 / "press the button" / 28.6% (sequence includes "put the cube on the table" before the press); PickXtimes 3-11 / "press the button to stop" / 22.6%; BinFill 3-9 / "press the button" / 25.7%; StopCube 3 / "press the button to stop the cube on the target" / 24.0%; VideoRepick 3-7 / "press the button to finish" / 30.4%; VideoUnmask 1-3 / "pick up the container that hides ..." / 87.0%; VideoUnmaskSwap 1-3 / 69.2%; ButtonUnmask (5 episodes) 2-4 / 51.7%; ButtonUnmaskSwap 3-5 / 34.0%; InsertPeg 2 / 58.4%; MoveCube 1-2 / 67.8%; PatternLock 1-6 / 53.0%; PickHighlight 2-6 / 47.4%; RouteStick 1-5 / 48.6%; VideoPlaceButton 2 / 45.9%; VideoPlaceOrder 2 / 46.2%.
+**0.3** (done 2026-10-06 from eval logs): QwenVL's "press the button" came {1:3, 2:2, 3:1, 4:4, 5:1, 6:2} subgoals early over 13 SwingXtimes fails; first premature press caption 48-464 steps before the failure (typically ~80).
+**Fake-terminal simulation** (plan rates, every execution step of ≤20 episodes/task), fake share of SHOWN-terminal samples, terminal-jump 0.25 / 0.40: SwingXtimes 0.298/0.348, BinFill 0.393/0.437, PickXtimes 0.432/0.467, **StopCube 0.545/0.525 (>0.5 cap)**, VideoRepick 0.112/0.124, all others ≤0.087, VideoUnmask 0.003.
+**Proposed (awaiting user OK):** terminal-jump share 0.40 for counting tasks; StopCube p_shift 0.40→0.30; count shifts from the shown caption. 0.4 (oracle-caption eval, ~$2) not yet run.
+
+### 2026-10-06 — Hybrid QwenVL eval STOPPED by user at 26/50 ("does not give us any new answer"): VideoUnmask 12/13 = 92.3%, SwingXtimes 0/13 = 0%
+**Tags:** #hybrid #eval #baseline
+`modal app stop ap-q2Ju90jEDTPHpfHqn2OGPX` (eval account) on user request; verified nothing running on either account. 26 episodes saved (volume `hybrid-s9999-qwenvl-eval-results`; local `hybrid_prompt_modul/eval/hybrid_s9999_qwenvl_episodes.{csv,jsonl}`). Seed 0, QwenVL captions, 1300-step cap. Per episode (outcome, steps):
+- VideoUnmask: ep0 success 101, ep1 success 120, ep2 success 117, ep3 success 269, ep4 success 123, ep5 success 132, ep6 success 96, **ep7 fail 108**, ep8 success 124, ep9 success 135, ep10 success 97, ep11 success 312, ep12 success 110 → **12/13 = 92.3%** (anchors: GroundSG+QwenVL 88.67 paper / 91.7% this harness; FrameSamp+Modul 32.67).
+- SwingXtimes: ep0 fail 479, ep1 fail 428, ep2 fail 391, ep3 fail 368, ep4 fail 410, ep5 fail 711, ep6 fail 336, ep7 fail 412, ep8 fail 405, ep9 fail 535, ep10 fail 351, ep11 fail 470, ep12 fail 376 → **0/13** (anchors: FrameSamp+Modul 92.00 paper / 96.7% this harness; GroundSG+QwenVL 7.33), all "fail", 0 timeouts.
+This is the BEFORE baseline for the timing-shift fix plan (discussed 2026-10-06 in chat: shift captions ±1 subgoal for ~25% of training samples with true actions; gates: VideoUnmask must hold, SwingXtimes must rise).
+
+### 2026-10-06 — Hybrid QwenVL eval batch RESUMED (user: "continue evaluating"): 22 done, 28 dispatched
+**Tags:** #hybrid #eval
+`run_batch --target hybrid` with `--detach`, spawned `fc-01M4817QKN6M9PQK3VQMV867R1`, app `ap-q2Ju90jEDTPHpfHqn2OGPX` (eval account), verified `ephemeral (detached)`. Resumes the batch stopped 2026-10-05 ~23:10 (VideoUnmask 10/11, SwingXtimes 0/11). Note: a half-applied edit adding a `hybrid_oracle` target (oracle-caption diagnostic) is in `run_hybrid_eval.py` — TARGETS entry + volume only, loader/episode loop NOT wired; `--target hybrid_oracle` must not be used until finished. The `hybrid` target is unaffected.
+
+### 2026-10-05 ~23:20 — SwingXtimes failure analysis (11/11 episodes, local logs, no compute): QwenVL says "press the button" early; the policy obeys the caption over its frame memory
+**Tags:** #hybrid #analysis
+Compared QwenVL vs oracle subgoal text (coordinates stripped) at every query, per episode (`hybrid_s9999_qwenvl_episodes.jsonl`):
+
+| ep | fail step | text match | first mismatch (step: qwen vs oracle) | last query: qwen vs oracle |
+|---|---|---|---|---|
+| 0 | 479 | 18/30 | 288: left 2nd vs right 2nd | press the button vs right 2nd |
+| 1 | 428 | 11/27 | 176: left 1st vs right 1st | press the button vs right 2nd |
+| 2 | 391 | 13/25 | 208: left 1st vs right 1st | press the button vs right 1st |
+| 3 | 368 | 12/23 | 192: left 2nd vs right 2nd | press the button vs left 2nd |
+| 4 | 410 | 10/26 | 144: left 1st vs right 1st | press the button vs left 1st |
+| 5 | 711 | 12/45 | 192: put cube on table vs left 1st | press the button vs left 1st |
+| 6 | 336 | 10/21 | 160: put cube on table vs left 1st | press the button vs left 1st |
+| 7 | 412 | 8/26 | 128: left 1st vs right 1st | press the button vs right 1st |
+| 8 | 405 | 11/26 | 160: left 1st vs right 1st | press the button vs right 2nd |
+| 9 | 535 | 17/34 | 208: pick up cube vs right 1st | press the button vs right 2nd |
+| 10 | 351 | 9/22 | 144: left 1st vs right 1st | press the button vs left 1st |
+
+**Verified from logs:** in 11/11, QwenVL's caption runs ahead of the real swing progress and ends at "press the button" while the oracle says the swing is incomplete; every episode fails within one chunk (<=16 steps) of that last query. **Inferred:** the robot pressed the button early; the frame memory (which FrameSamp+Modul alone uses to count swings, 92%) did not override the caption. Consistent with check_routes (caption effect ~4x frame effect) and with the paper's GroundSG Oracle 100% vs QwenVL 7.33% on SwingXtimes.
+**Hypotheses (untested):** (1) training captions are ground truth and always agree with frames, so obeying the caption is optimal and the model never learned to arbitrate; (2) the GroundSG warm start's caption-following prior; (3) the prompt route names the decision directly while the modulator only rescales FFN inputs.
+**Proposed next steps (not run):** (a) hybrid on SwingXtimes with ORACLE captions, ~10 eps — near 100% would confirm caption timing as the cause; (b) caption-corruption augmentation in training (mistimed next/previous subgoal with correct actions) so frames must verify progress, fine-tuned from step 9999; (c) lighter alternative: caption dropout.
+
+### 2026-10-05 ~23:10 — Hybrid eval batch STOPPED by user (no overnight run) at 22/50: VideoUnmask 10/11 = 90.9%, SwingXtimes 0/11 = 0%
+**Tags:** #hybrid #eval #partial
+User: "stop it, i don't want it to work overnight". `modal app stop ap-L5TO4I9Pxr4bRCl1ahfqQN` (eval account); verified no running apps on either account. 22 finished episodes saved on volume `hybrid-s9999-qwenvl-eval-results` and locally in `hybrid_prompt_modul/eval/hybrid_s9999_qwenvl_episodes.{csv,jsonl}`; the in-progress episode is lost. VideoUnmask 10 success / 1 acted-wrong (±8.7 pp); SwingXtimes 0 success / 11 acted-wrong, 0 timeouts. Resume anytime with `run_batch --target hybrid --detach` (skips finished episodes).
+
+### 2026-10-05 23:02 — Hybrid@9999 eval PARTIAL (20/50): VideoUnmask 9/10 = 90% (GroundSG-level); SwingXtimes 0/10 = 0% (GroundSG-level, NOT FrameSamp-level) — all fails, no timeouts
+**Tags:** #hybrid #eval #partial
+App `ap-L5TO4I9Pxr4bRCl1ahfqQN` (eval account), still running (4 tasks). seed 0, QwenVL captions. VideoUnmask 9 success / 1 acted-wrong / 0 timeout (±9.5 pp; anchors FrameSamp+Modul 32.67, GroundSG+QwenVL 88.67). SwingXtimes 0 success / 10 acted-wrong ("fail" status) / 0 timeout (anchors 92.00 / 7.33). Per-episode CSV + caption JSONL: `hybrid_prompt_modul/eval/hybrid_s9999_qwenvl_episodes.{csv,jsonl}` (20 episodes at dump time).
+**First look at SwingXtimes captions (ep0-2, 25-30 queries each):** QwenVL's subgoal sequence matches the oracle's (pick up cube → right target 1st → left target 1st → right target 2nd ...), coordinates within ~5 px. In ep2 QwenVL advanced to "left target ... / right target for the second time" while the oracle was still at "right target for the first time" — caption ran ahead of real progress, and the policy followed it. Tentative reading (n=10, not yet analysed across episodes): the hybrid inherits GroundSG's caption-following behaviour on SwingXtimes; the frame route (live per check_routes, ~9% action effect vs ~41% for captions) does not override caption timing errors. Paper context: GroundSG+Oracle gets 100% on SwingXtimes vs 7.33% with QwenVL — i.e. caption timing/count errors are the known GroundSG failure mode here.
+
+### 2026-10-05 ~16:55-17:15 — Hybrid@9999 eval smoke test PASS; eval batch LAUNCHED (VideoUnmask + SwingXtimes × 25, QwenVL captions)
+**Tags:** #hybrid #eval
+Eval account noor-koni2002. `run_smoke_test --target hybrid`: `history_config.txt matches the build config`; `[eval-load] 71 params from checkpoint, 0 fresh-initialized, 0 unused`; policy on **L4**: actions [16, 8] finite, caption change → 2.48% action change on the synthetic scene (released GroundSG control on the same scene: 3.39%); QwenVL with decord video read → `pick up the container at <111, 69> that hides the red cube`. Batch: `run_batch --target hybrid` with `--detach`, spawned `fc-01M46PZ6BQKZ5EZMWSHEKQVANN`, app `ap-L5TO4I9Pxr4bRCl1ahfqQN`, verified `ephemeral (detached)`; 0 done, 50 dispatched (seed 0, interleaved VideoUnmask/SwingXtimes, 25 each), results volume `hybrid-s9999-qwenvl-eval-results`. Anchors: VideoUnmask FrameSamp+Modul 32.67 / GroundSG+QwenVL 88.67 (this harness: 91.7%, 11/12); SwingXtimes 92.00 / 7.33 (FrameSamp+Modul in this project's harness: 96.7%).
+
+### 2026-10-05 ~16:30-16:50 — Hybrid training COMPLETE (10k); step 9999 published to HF `Nkoni/hybrid-groundsg-prompt-framesamp-modul`
+**Tags:** #hybrid #training
+Training app `ap-4kQJ8OaqNGYfDhF4m78ZZs` finished on its own (user confirmed "app exited successfully"; state `stopped`), single launch, no resume. Saved steps: **2000, 4000, 6000, 8000, 9999** (all kept) on volume `hybrid-prompt-modul-training`, dir `ckpts/hybrid_prompt_modul/hybrid-groundsg-prompt-framesamp-modul/`. Step-9999 dir = `params/`, `assets/hybrid_prompt_modul/` (norm stats), `_CHECKPOINT_METADATA` (no optimizer state).
+**Upload:** added `upload_checkpoint_detached` (spawn, so a ~7 GB upload survives the local client exiting); launched with `--detach` (app `ap-ccLcPKW7yEMI9fWZqTnAc3`, `fc-01M464NAKS5T9X7TN9T7QMDMSE`). HF repo now has `9999.zip` = 6,673,724,890 bytes and `history_config.txt` = 450 bytes (the hybrid yaml: perceptual / frame_sampling / modulation + `symbolic_in_prompt: grounded_subgoal`) by 16:46. Zip is ~6.7 GB, not ~12 GB as first estimated: frozen VLM + SigLIP stored bf16, no optimizer state — consistent with param counts; full completeness is enforced at eval load (zero-fresh check).
+**Next (needs user go-ahead):** eval account: `run_smoke_test --target hybrid` (policy on L4), then `run_batch --target hybrid` = VideoUnmask + SwingXtimes × seed 0 × 25.
+
+### 2026-10-05 13:55-14:15 — Hybrid training at step ~2,730: loss flat since ~step 100; step-2000 route check PASS (both routes alive); user chose to finish 10k
+**Tags:** #hybrid #training #diagnostic
+**Training (`ap-4kQJ8OaqNGYfDhF4m78ZZs`) at 13:55:** 2,730/10,000, elapsed 1:36, ~0.47 it/s (slower than XF's 1.1-1.2 it/s; ETA ~4.4 h more, ~18:20, inside the 8 h timeout). Single-batch (n=4) losses: step 0 0.0108; ~step 80-120 0.0037-0.0062; steps 2360/2460/2560/2660: 0.0044/0.0044/0.0041/0.0030 (grad_norm 0.077-0.103). Most of the drop happened in the first ~100 steps (re-aligning the transplanted modulator), roughly flat since. User decision: run to 10k (remaining training ~$4.8 < one eval ~$10-11), evaluate only the final checkpoint.
+**check_routes --mode trained --step 2000** (A10G, separate container, 16 real samples, same loader seed as the init check): load = 71 params from checkpoint, **0 fresh**, 0 unused (also exercises the zero-fresh load path used by resume/eval).
+
+| intervention | step 0 (init) | step 2000 |
+|---|---|---|
+| floor | 0.000% | 0.000% |
+| caption swap (mean / max) | 43.805% / 149.777% | 40.744% / 139.570% |
+| frame swap (mean / max) | 8.990% / 40.726% | 9.287% / 60.829% |
+
+**Reading:** both routes stay live through training; no drift toward XF's caption-ignoring failure (captions still ~4x the frame effect and ~200x XF's 0.2%). Frame-swap max rose 40.7% → 60.8% (mean flat), i.e. frames matter more on some samples. n=16, rough.
+
+### 2026-10-05 12:48-13:00 — Calibration STOPPED early by user (cost): released GroundSG+QwenVL VideoUnmask 11/12 = 91.7% (±8.0 pp) vs paper 88.67; eval cut to 25 eps/task + policy on L4
+**Tags:** #hybrid #calibration #baseline
+Batch `ap-nFwJkzKM7eU3XXTQIcCMwv` (eval account noor-koni2002) stopped with `modal app stop` after the user confirmed ("yes"), 11:57-~12:50; ~4.2 min/episode, ~$2.5/h for T4 sim + A10G policy + L4 QwenVL. Finished episodes were saved; the in-progress one is lost. Per-episode (seed 0, VideoUnmask, test split, 1300-step cap):
+
+| ep | outcome | steps |
+|---|---|---|
+| 0 | success | 115 |
+| 1 | success | 110 |
+| 2 | success | 108 |
+| 3 | success | 263 |
+| 4 | success | 182 |
+| 5 | success | 103 |
+| 6 | success | 296 |
+| 7 | **fail** | 173 |
+| 8 | success | 167 |
+| 9 | success | 162 |
+| 10 | success | 130 |
+| 11 | success | 304 |
+
+**Reading:** consistent with the paper's 88.67 → this harness's QwenVL pipeline (sdpa, decord) reproduces GroundSG+QwenVL within error; n=12, one seed, so ±8 pp. The only failure is attributable to QwenVL, not the policy: ep7 QwenVL said `pick up the container at <90, 78> that hides the green cube` at every query, oracle `<92, 137>` (wrong container). Files: `hybrid_prompt_modul/eval/control_groundsg_qwenvl_episodes.csv` / `.jsonl`.
+**Eval changes (user):** `NUM_EPISODES` 50→25 per task (anchor gaps 56/85 pp ≫ ±9 pp at n=25); `PolicyServer`/`policy_smoke_test` A10G→L4. L4 policy check: released GroundSG loaded and ran smoke inferences on L4 with no error/OOM (return dict not printed by a direct function call; the full run_smoke_test before the hybrid batch prints it).
+**Also:** a local background log-monitor was killed by Claude Code for low system memory (local only; Modal jobs unaffected).
+
+### 2026-10-05 12:17 — Hybrid training run LAUNCHED (10,000 steps, batch 4, A10G)
+**Tags:** #hybrid #training
+`launch_hybrid_training.py::run_training --num-train-steps 10000 --batch-size 4`, `--detach`, spawned `fc-01M45NNTJ1GTZG0ENTQAQ4N1B8`, app `ap-4kQJ8OaqNGYfDhF4m78ZZs`, nour-mkawni; verified `ephemeral (detached)`, 1 task. EXP_NAME `hybrid-groundsg-prompt-framesamp-modul` (fresh, overwrite guard passed — no prior checkpoints). Warm start GroundSG@79999 + FrameSamp+Modul@79999 memory modules + fresh LoRA; lr 5e-5 (500 warmup), save every 2000 (all kept) + final 9999. Expected ~2.5 h. Gate after step 2000: `check_routes --mode trained --step 2000`. In parallel: calibration batch (GroundSG+QwenVL, VideoUnmask) at 4/50, 4 successes at 12:15.
+
+### 2026-10-05 12:06-12:14 — Hybrid run_tentative PASS on A10G at batch 4 (first launch, no OOM)
+**Tags:** #hybrid #tentative
+`launch_hybrid_training.py::run_tentative_detached` (`--detach`, spawned `fc-01M45N1KN4DAN81G3KJE7G0RQN`, app `ap-6JbCeQkH4SALmOukbXusqs`, nour-mkawni, A10G, mem fraction 0.95), exp dir `hybrid-groundsg-prompt-framesamp-modul-tentative`. Norm stats loaded from `assets/hybrid_prompt_modul/hybrid_prompt_modul` (no "skipping"). Merge: 51 GroundSG + 10 FrameSamp+Modul memory params = 61 from checkpoints, 10 fresh (LoRA), 0 unused. Memory-related trainable size 84.4 MB, non-memory 463.3 MB. XLA step estimate 15.02 GiB (fits; ~21.4 GiB available). **Step 0: grad_norm=0.3464, llm_grad_norm=0.2695, loss=0.0108, mem_enc_norm=0.0013, param_norm=1868.22.** "Tentative run completed"; app stopped 12:14 on its own. Step-0 loss 0.0108 is low (cf. XF symroute step-0 0.052 incl. aux term) — consistent with both released checkpoints already being trained on this data. One batch only, so not a statement about training quality.
+
+### 2026-10-05 11:42-12:02 — Hybrid arm first Modal runs: control + QwenVL smoke tests PASS, checkpoints staged, step-0 route check PASS (both memory routes live); calibration batch running
+**Tags:** #hybrid #infra #diagnostic
+**Control smoke test** (eval account noor-koni2002, app `ap-nKviJmD2PF6p4RwStWgA1j`, A10G + L4): released GroundSG@79999 loaded via the paper's `create_trained_policy` as symbolic/grounded_subgoal, max_token_len 128; caption change moved its actions 3.4% (synthetic scene), finite. QwenVL (sdpa) returned `pick up the red cube at <113, 69> for the first time` (raw `(445,270)` on 0-1000 → 256 px, conversion correct). swift warned "Please install decord" — the smoke test had sent no video.
+**Fix + rerun** (app `ap-bkwm1c6UcQaI9MYrl2oZoz`): added `decord` to the QwenVL image; smoke test now sends a 40-frame demo video. Log: "qwen-vl-utils using decord to read video"; answer `pick up the container at <111, 69> that hides the red cube`. PASS.
+**Calibration batch launched 11:57** (`ap-nFwJkzKM7eU3XXTQIcCMwv`, `--detach`, verified `ephemeral (detached)`, 4 tasks): released GroundSG + QwenVL, VideoUnmask × seed 0 × 50. Paper anchor 88.67.
+**stage_checkpoints** (training account nour-mkawni, `ap-v9VEIPPiEHrcONbTmvFGD5`, CPU): GroundSG@79999 + FrameSamp+Modul@79999 staged; GroundSG norm stats copied (state dim 8). FrameSamp memory subset = 10 params / 88.5M values: `mem_attn` {q,kv,out}_einsum_mem + mem_rms_norm (18 layers), `mem_rms_norm_ffn/Dense_0` kernel (18,1024,2048) + bias, `mem_encoder/feature_encoder` encoder_static (2816→1024) + pos_proj.
+**check_routes --mode init** (`ap-Mt25FZAohJxGfTknSDnxZN`, A10G, 4 real batches × 4 = 16 samples, no OOM): warm-start merge = 51 params from GroundSG + 10 from FrameSamp+Modul = 61 from checkpoints, 0 unused, **10 fresh = exactly the LoRA a/b pairs** (attn q/kv/out, mlp gating/linear). Relative action change at step 0:
+
+| intervention | mean | max | n |
+|---|---|---|---|
+| floor (rerun same inputs) | 0.000% | 0.000% | 16 |
+| caption swap | 43.805% | 149.777% | 16 |
+| frame swap | 8.990% | 40.726% | 16 |
+| frame route off (modulator zeroed ≈ GroundSG) | 10.542% | 41.858% | 16 |
+
+**Reading:** both routes are live at step 0 — captions dominate (~44%, vs XF's ~0.2% caption-swap failure), the transplanted frame path already moves actions (~9-11%, far above the 0 floor). The ~10.5% shift away from GroundSG at step 0 is what the fine-tune must re-align (modulator trained beside a different action expert). n=16, so magnitudes are rough.
+**Next:** tentative → training need user go-ahead; calibration result pending.
+
+### 2026-10-05 (after 10:51) — Hybrid arm: verified against paper code; warm start changed to GroundSG + FrameSamp+Modul memory; GroundSG+QwenVL calibration control added — still nothing run on Modal
+**Verification vs `robomme_policy_learning` (user request):** model = released `HistoryPi0` FrameSamp+Modul path unchanged + `embed_prefix` identical to the released symbolic branch; prompt/tokenizer/128 tokens, caption augmentations, loss, sampler, eval server (`MME_VLA_Policy`) and eval loop (incl. `clear_buffers` resetting exec_start_idx) identical. Only branch difference — `na_mask` passed for perceptual — proven a no-op: numpy port of `make_attn_mask` on the hybrid's real layout (2×256 image + 128 prompt + 20 action tokens), 5/5 trials identical masks. Deviations from the paper are recipe-only: 10k×4 vs 80k×64 samples, LoRA VLM vs full, no EMA vs 0.999; QwenVL sdpa vs flash-attn.
+**Existing harness calibration on record (committed `modal_reproduction/full_eval_episodes.csv`, released FrameSamp+Modul):** VideoUnmask 19/59 = 32.2% (paper 32.67), SwingXtimes 58/60 = 96.7% (paper 92.00). GroundSG+QwenVL never reproduced in this project.
+**Decisions (user, this session):** (1) warm start = GroundSG@79999 everything + FrameSamp+Modul@79999 memory modules only (`mem_encoder`, `mem_attn`, `mem_rms_norm_ffn`) + fresh LoRA (`training/two_checkpoint_loader.py`; memory subset pre-extracted to an .npz by `stage_checkpoints`); (2) eval `--target control_groundsg` runs released GroundSG@79999 via the paper's own `create_trained_policy` through the same QwenVL pipeline.
+**Verified locally (stubs for flax/openpi):** two-checkpoint loader takes non-memory weights from GroundSG only, memory weights from FrameSamp only, LoRA only fresh; raises when the base already has memory modules, an npz key is not in the model, a memory module is missing, or FrameSamp has no memory params. Ruff/compile clean. Also fixed: training now refuses to start if norm_stats.json is missing (released code only logs "skipping").
+**Next (each needs user go-ahead):** control calibration VideoUnmask ×50 (eval account) ‖ `stage_checkpoints` → `check_routes --mode init` → tentative → training.
+
+### 2026-10-05 ~10:30-10:51 — Hybrid arm BUILT (`hybrid_prompt_modul/`): GroundSG caption in prompt + FrameSamp+Modul, QwenVL-caption eval — nothing run on Modal yet
+**Goal:** Implement the "prompt+modul" combination from the 10:26 entry as its own arm, evaluated with QwenVL-predicted captions (GroundSG+QwenVL, the paper's best deployable symbolic setting), not oracle. #idea
+**Design:** `HybridPi0` = released `HistoryPi0` in FrameSamp+Modul mode with only `embed_prefix` overridden (GroundSG prompt `Task: ...;\nCurrent Subgoal: ...;\nAction: `, 128 tokens). Warm start = GroundSG@79999 (`Yinpei/mme_vla_suite/symbolic-grounded-subgoal/79999.zip`); new = modulator + frame encoder + LoRA. Norm stats copied from the GroundSG checkpoint. GroundSG's 50% online-caption swap and ±8 px coord noise re-enabled for this arm. Same recipe as other arms (LoRA VLM, lr 5e-5, batch 4, A10G), default 10,000 steps. Eval: sim (T4) + policy (A10G) + Qwen3-VL-4B + `qwenvl/grounded_subgoal/checkpoint-1200` adapter (L4, sdpa attention instead of flash-attn), QwenVL queried every 16-step chunk as in released `eval.py`; per episode logs QwenVL vs oracle caption at each query. Default eval = VideoUnmask + SwingXtimes × seed 0 × 50.
+**Paper anchors resolved (appendix per-task table, 3 seeds):** VideoUnmask FrameSamp+Modul 32.67 / GroundSG+QwenVL 88.67; SwingXtimes 92.00 / 7.33. This settles the open caveat from the 2026-09-23 entries: the 88.7 VideoUnmask anchor IS the QwenVL number, not oracle.
+**Verified locally (no GPU):** all files compile; ruff F/E9 clean (only jaxtyping F722 false positives, also present 14x in released history_pi0.py). Config loader: yaml == released FrameSamp+Modul + `symbolic_in_prompt`; wrong configs (symbolic repr / context integration / no prompt block) all raise. Checked merge (`shared/param_merge.py`, flax helpers stubbed): warm start OK with exactly mem_*/lora fresh; resume-with-fresh, unexpected non-mem fresh, and a checkpoint already containing mem_encoder all RAISE; int-vs-str list-index keys match; eval keeps loaded dtype.
+**NOT verified (needs Modal):** model build/JIT, data path on the real volumes, OOM at batch 4, QwenVL image install (ms_swift 3.11.1 / transformers 4.57.3 / torch 2.9.1), the step-0 no-op claim.
+**Next:** `stage_groundsg` (CPU) → `check_routes --mode init` (A10G) → tentative → training, each only with user go-ahead.
+
+### 2026-10-05 ~10:26 — Feasibility check: GroundSG-in-prompt + FrameSamp+Modul ("prompt+modul") — not a config change; GroundSG checkpoint IS released
+**Goal:** Check whether the naive combination (grounded subgoal caption in the VLM prompt, as GroundSG does, plus FrameSamp+Modul perceptual memory) can run in the upstream code, and whether a GroundSG checkpoint exists to warm-start from. Not run in the paper: its only hybrid is MemER, which combines the two memories at the VLM subgoal-predictor level, not inside the policy. #idea
+**Findings (code read, nothing run):**
+- Upstream treats the two as mutually exclusive: one `representation_type` enum (`history_pi0.py:250-282`); symbolic forces `integration_type=None`. Caption-in-prompt is gated on `representation_type == "symbolic"` in 5 places: `history_pi0.py:468` (embed_prefix), `history_pi0.py:94,114` (max_token_len doubling, inputs_spec), `training/config.py:240` (tokenizer transform), `training/dataset.py:199,207` (online-subgoal swap + coord-noise augmentation), `policies/policy.py:52,78,130` (eval memory buffer skipped for symbolic).
+- Checkpoint: `Yinpei/mme_vla_suite/symbolic-grounded-subgoal/79999.zip` (11.55 GB) exists alongside `perceptual-framesamp-modul/79999.zip` (11.88 GB).
+- Warm-starting from GroundSG + fresh modulator should start close to GroundSG's behaviour: `MemoryRMSNorm` (`history_gemma.py:37-41`) applies scale/shift from a Dense with init std 0.002 to an extra RMSNorm that sits right before `pre_ffw_norm` (also RMSNorm, so the extra norm is ~idempotent), and the residual stream uses the un-modulated `xs`. Not yet measured.
+- Weight loader merges with `missing_regex=".*"` (`training/config.py:450`) → missing params are silently fresh-initialized; needs a loud fresh-init report before any warm-start.
+**Next:** decide whether to build it (est. ~6 gated sites + a new history yaml); first check after building = step-0 action diff vs pure GroundSG on a real batch (should be ~0), then caption-swap/frame-swap counterfactuals early in training.
+
 ### 2026-09-28 10:40-12:40 — Current-image target marker (learned vector): barely learned (norm 0→0.06); target sensitivity did NOT rise (container coord_moved 1.6%)
 **Tags:** #xf #result #negative-result #marker
 
