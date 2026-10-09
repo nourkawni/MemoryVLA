@@ -42,6 +42,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from mme_vla_suite.training.dataset import RoboMMEDataset, SampleDataset, load_vector_file
 
 from hybrid_prompt_modul.shared.config_utils import get_hybrid_history_config, validate_hybrid_history_config
+from hybrid_prompt_modul.training.caption_corruption import (
+    CorruptionStats,
+    build_windows,
+    corrupt_caption,
+    corruption_config_from_yaml,
+)
 from hybrid_prompt_modul.training.caption_shift import ShiftStats, choose_shift, find_true_index, shift_config_from_yaml
 
 # int, number of feature-shard volumes (xf-features-shard-0..3).
@@ -260,7 +266,13 @@ class HybridDataset(RoboMMEDataset):
         self.shift_cfg = shift_config_from_yaml(history_config.get("caption_shift"))  # ShiftConfig | None
         self.episode_timeline = {}  # dict[int, tuple[str, list[dict]]], epis_idx -> (task, execution intervals)
         self.shift_stats = ShiftStats()  # ShiftStats, per DataLoader worker
-        if self.shift_cfg is not None:
+        # General caption corruption (variant "general"): OFF unless the yaml enables caption_corruption.
+        self.corrupt_cfg = corruption_config_from_yaml(history_config.get("caption_corruption"))  # CorruptionConfig | None
+        self.corrupt_stats = CorruptionStats()  # CorruptionStats, per DataLoader worker
+        self.episode_windows = {}  # dict[int, list[dict]], built lazily, deterministic per episode
+        if self.shift_cfg is not None and self.corrupt_cfg is not None:
+            raise ValueError("enable at most one of caption_shift / caption_corruption")
+        if self.shift_cfg is not None or self.corrupt_cfg is not None:
             self._load_timelines(dataset_path)
 
     def _load_timelines(self, dataset_path: str) -> None:
@@ -279,7 +291,43 @@ class HybridDataset(RoboMMEDataset):
             None (prints "[caption_shift] loaded 1307 timelines ...")
         """
         self.episode_timeline = load_episode_timelines(dataset_path)
-        print(f"[caption_shift] loaded {len(self.episode_timeline)} timelines; config {self.shift_cfg}")
+        print(f"[caption_aug] loaded {len(self.episode_timeline)} timelines; "
+              f"shift config {self.shift_cfg}; corruption config {self.corrupt_cfg}")
+
+    def _maybe_corrupt_caption(self, data: dict) -> None:
+        """
+        What it does:
+            Applies the general caption corruption to data["grounded_subgoal"]
+            in place (see caption_corruption.py): if the sample's step falls in
+            one of its episode's windows, shows the window's held caption or
+            no caption. Never touches the action label.
+
+        Returns:
+            None.
+
+        Example input:
+            self._maybe_corrupt_caption({"epis_idx": array([802]), "step_idx": array([310]), "grounded_subgoal": "move ...", ...})
+
+        Example output:
+            None (grounded_subgoal possibly replaced by a held caption or "")
+        """
+        epis_idx = _scalar(data["epis_idx"])  # int
+        entry = self.episode_timeline.get(epis_idx)  # tuple | None
+        if entry is None:
+            return
+        task, intervals = entry  # str, list[dict]
+        windows = self.episode_windows.get(epis_idx)  # list[dict] | None
+        if windows is None:
+            windows = build_windows(epis_idx, intervals, self.corrupt_cfg)
+            self.episode_windows[epis_idx] = windows
+        shown, outcome = corrupt_caption(intervals, windows, _scalar(data["step_idx"]), data["grounded_subgoal"])  # str, str
+        self.corrupt_stats.record(task, outcome)
+        data["grounded_subgoal"] = shown
+        if self.corrupt_stats.samples == self.corrupt_cfg.guard_after:
+            self.corrupt_stats.check(self.corrupt_cfg)  # raises (stops training) if rates are off-intent
+        if self.corrupt_stats.samples % SHIFT_LOG_EVERY == 0:
+            print(f"[caption_corruption] pid {os.getpid()} after {self.corrupt_stats.samples} samples:")
+            print(self.corrupt_stats.summary())
 
     def _maybe_shift_caption(self, data: dict) -> None:
         """
@@ -374,6 +422,8 @@ class HybridDataset(RoboMMEDataset):
         # Order (plan): online/recorded pick (HybridSampleDataset) -> timing shift -> +-8 px noise.
         if self.shift_cfg is not None:
             self._maybe_shift_caption(data)
+        if self.corrupt_cfg is not None:
+            self._maybe_corrupt_caption(data)
         data["grounded_subgoal"] = self.add_grounding_augmentation(data["grounded_subgoal"], noise_range=GROUNDING_NOISE_RANGE)
         data["simple_subgoal"] = self.add_grounding_augmentation(data["simple_subgoal"], noise_range=GROUNDING_NOISE_RANGE)
         return data

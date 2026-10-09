@@ -28,6 +28,12 @@ policy's actions. Two modes:
                   the policy obeys a premature caption (the 2026-10-05 failure); the fine-tune
                   should make both shrink. Captions are taken noise-free from the episode
                   timeline (load_episode_timelines), identical for all three variants.
+  --per-task      (either mode) for each listed task, e.g. "VideoUnmask,SwingXtimes": real samples of
+                  that task only (8 per task), and the action change when (a) the caption is
+                  REMOVED, (b) the frame memory is REMOVED (static_mask all False), (c) the caption
+                  is swapped with another sample of the same task, (d) the frame memory is swapped
+                  likewise. (a) large => the task follows the caption; (b) large => it follows the
+                  frames. Answers "which memory does each task use".
   --variant       which training variant's checkpoint dir --mode trained reads (base |
                   timingshift). The data pipeline is ALWAYS the base config (same model, caption
                   shifting OFF), so measurements are never perturbed by the augmentation itself.
@@ -45,6 +51,7 @@ Run (training account, after stage_checkpoints; trained mode after a checkpoint 
     modal run hybrid_prompt_modul/diagnostics/check_routes.py --mode trained --step 2000
     modal run hybrid_prompt_modul/diagnostics/check_routes.py --mode trained --step 9999 --swing-ahead
     modal run hybrid_prompt_modul/diagnostics/check_routes.py --mode trained --variant timingshift --step 1999 --swing-ahead
+    modal run hybrid_prompt_modul/diagnostics/check_routes.py --mode trained --step 9999 --per-task VideoUnmask,SwingXtimes
 """
 
 import pathlib
@@ -71,7 +78,8 @@ MODULATOR_REGEX = ".*mem_rms_norm_ffn.*"  # str, the modulator's scale/shift Den
 
 @app.function(image=image, gpu="A10G", timeout=3600, volumes=training_volumes)
 def check_routes_remote(mode: str = "init", step: int | None = None, num_batches: int = 4, batch_size: int = 4,
-                        variant: str = "base", swing_ahead: bool = False, swing_samples: int = 16) -> dict:
+                        variant: str = "base", swing_ahead: bool = False, swing_samples: int = 16,
+                        per_task: str = "", per_task_samples: int = 8) -> dict:
     """
     What it does:
         Builds the model (see module docstring), draws `num_batches` real
@@ -206,6 +214,9 @@ def check_routes_remote(mode: str = "init", step: int | None = None, num_batches
 
     if swing_ahead:
         rows.update(_swing_ahead_rows(config, data_config, state, _sample, batch_size, swing_samples))
+    if per_task:
+        tasks = [t.strip() for t in per_task.split(",") if t.strip()]  # list[str]
+        rows.update(_per_task_rows(config, data_config, state, _sample, batch_size, tasks, per_task_samples))
 
     summary = {  # dict[str, dict]
         name: {"mean": float(np.mean(vals)) if vals else float("nan"),
@@ -309,9 +320,100 @@ def _swing_ahead_rows(config, data_config, state, sample_fn, batch_size: int, nu
     return out
 
 
+def _per_task_rows(config, data_config, state, sample_fn, batch_size: int, tasks: list[str], n_per_task: int) -> dict:
+    """
+    What it does:
+        Container-side. For each task, draws `n_per_task` random real samples
+        of that task (any step), and measures the relative action change vs
+        the unmodified sample when the caption is removed, the frame memory is
+        removed, the caption is swapped with another sample of the same task,
+        and the frame memory is swapped likewise (rolled by one within the
+        task's samples). Same fixed noise for every variant of a sample.
+
+    Returns:
+        dict[str, list[float]] -- {"<task>: caption removed": [...], "<task>: frames removed": [...],
+        "<task>: caption swapped (same task)": [...], "<task>: frames swapped (same task)": [...]}.
+
+    Example input:
+        _per_task_rows(config, data_config, state, _sample, 4, ["VideoUnmask", "SwingXtimes"], 8)
+
+    Example output:
+        {"VideoUnmask: caption removed": [0.52, ...], "VideoUnmask: frames removed": [0.08, ...], ...}
+    """
+    import random
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from openpi.training.data_loader import transform_dataset
+
+    from mme_vla_suite.models.integration.history_observation import HistAugObservation
+
+    from hybrid_prompt_modul.training.hybrid_dataset import HybridDataset, _scalar, load_episode_timelines
+    from hybrid_prompt_modul.training.launch_hybrid_training import DATASET_PATH
+
+    if n_per_task % batch_size:
+        raise ValueError("per_task_samples must be a multiple of batch_size (reuses the compiled batch shape)")
+    dataset = HybridDataset(DATASET_PATH, data_config, config.model.history_config, config.model.action_horizon)  # HybridDataset
+    timelines = load_episode_timelines(DATASET_PATH)  # dict[int, tuple[str, list[dict]]]
+    task_of = {e: t for e, (t, _) in timelines.items()}  # dict[int, str]
+
+    class _ListDataset:
+        """Minimal map-style dataset over prepared raw samples."""
+
+        def __init__(self, items):
+            self.items = items  # list[dict]
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, i):
+            return dict(self.items[i])
+
+    def _obs(items: list[dict]):
+        """Raw samples -> one batched HistAugObservation via the real transform pipeline."""
+        tds = transform_dataset(_ListDataset(items), data_config)  # transformed dataset
+        rows_t = [tds[i] for i in range(len(items))]  # list[dict]
+        batch = jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs]), *rows_t)  # dict
+        batch = {k: v for k, v in batch.items() if not (isinstance(v, np.ndarray) and v.dtype.kind in "UO")}  # drop strings
+        return HistAugObservation.from_dict(jax.tree.map(jnp.asarray, batch))
+
+    out = {}  # dict[str, list[float]]
+    frame_keys = ("static_image_emb", "static_pos_emb", "static_state_emb", "static_mask")  # tuple[str, ...]
+    for task in tasks:  # str
+        rng = random.Random(7)  # random.Random, same draws for every checkpoint
+        picked, tries = [], 0  # list[int], int
+        while len(picked) < n_per_task and tries < 40000:
+            tries += 1
+            idx = rng.randrange(len(dataset.dataset))  # int
+            if task_of.get(_scalar(dataset.dataset[idx]["epis_idx"])) == task:
+                picked.append(idx)
+        if len(picked) < n_per_task:
+            raise RuntimeError(f"only found {len(picked)} {task} samples")
+        items = [dataset[i] for i in picked]  # list[dict]
+        rolled = items[1:] + items[:1]  # list[dict], another sample of the same task
+        variants = {
+            "caption removed": [{**it, "grounded_subgoal": "", "simple_subgoal": ""} for it in items],
+            "frames removed": [{**it, "static_mask": np.zeros_like(it["static_mask"])} for it in items],
+            "caption swapped (same task)": [{**it, "grounded_subgoal": ro["grounded_subgoal"], "simple_subgoal": ro["simple_subgoal"]}
+                                            for it, ro in zip(items, rolled)],
+            "frames swapped (same task)": [{**it, **{k: ro[k] for k in frame_keys}} for it, ro in zip(items, rolled)],
+        }  # dict[str, list[dict]]
+        print(f"[check_routes] per-task {task}: {n_per_task} samples after {tries} draws")
+        for start in range(0, n_per_task, batch_size):  # int
+            chunk = slice(start, start + batch_size)  # slice
+            noise = jax.random.normal(jax.random.key(900 + start), (batch_size, config.model.action_horizon, config.model.action_dim))  # jax.Array
+            base = np.asarray(sample_fn(state, _obs(items[chunk]), noise), dtype=np.float64).reshape(batch_size, -1)  # float64[B, H*D]
+            for name, var_items in variants.items():  # str, list[dict]
+                alt = np.asarray(sample_fn(state, _obs(var_items[chunk]), noise), dtype=np.float64).reshape(batch_size, -1)  # float64[B, H*D]
+                out.setdefault(f"{task}: {name}", []).extend(
+                    (np.linalg.norm(alt - base, axis=1) / (np.linalg.norm(base, axis=1) + 1e-8)).tolist())
+    return out
+
+
 @app.local_entrypoint()
 def main(mode: str = "init", step: int | None = None, num_batches: int = 4, variant: str = "base",
-         swing_ahead: bool = False):
+         swing_ahead: bool = False, per_task: str = ""):
     """
     What it does: runs check_routes_remote and prints the result dict.
 
@@ -325,4 +427,4 @@ def main(mode: str = "init", step: int | None = None, num_batches: int = 4, vari
         (stdout) {"mode": "trained", ..., "rows": {...}}
     """
     print(check_routes_remote.remote(mode=mode, step=step, num_batches=num_batches, variant=variant,
-                                     swing_ahead=swing_ahead))
+                                     swing_ahead=swing_ahead, per_task=per_task))

@@ -70,6 +70,87 @@ Single table of the key numbers, updated as they come in. This is the table you'
 
 ## Log
 
+### 2026-10-08 — CORRECTION: timing-shift's SwingXtimes gains come from better swing EXECUTION, not from ignoring out-of-sync captions
+**Tags:** #hybrid #timingshift #analysis #correction
+Same SwingXtimes episodes, timing-shift successes vs original hybrid (swing captions out of sync with the oracle / longest stay on one oracle subgoal): ep0 TS success 2/18, 144 steps vs BASE fail 1/19, 208; ep5 TS 1/11, 128 vs BASE **0/12, 544**; ep6 TS 6/13, 128 vs BASE **0/10, 192**; ep9 TS 7/21, 112 vs BASE 6/23, 224.
+The 2026-10-06 explanation ("the old robot stalled because it obeyed QwenVL's out-of-sync target captions") is NOT supported for ep5/ep6: the original model stalled with perfectly in-sync captions, while timing-shift progressed even with 6-7 out-of-sync captions. Revised reading: timing-shift made SwingXtimes frame-driven (per-task: frames swapped 4%→34%, frames removed 5%→31%, caption swapped 47%→10%) and the robot executes swing motions without stalling (max 112-144 steps per subgoal vs up to 544) — consistent with perceptual memory's known role in motion-centric behaviour. Faster completion makes QwenVL's "press" land after the swings in 4/11; premature "press" still obeyed (0/7). Frame-use → smoother execution is an inference from two measurements, not a direct causal test.
+
+### 2026-10-08 — general-v2@5999: route gate PASS, uploaded, smoke PASS; eval LAUNCHED (SwingXtimes 12 + VideoUnmask 12, QwenVL)
+**Tags:** #hybrid #general #diagnostic #eval
+Training (app `ap-P85xFaDh7GsdMn3WN6qqW8`) completed: saved [2000, 4000, 5999]; final losses 0.002-0.005; no errors/preemption/memory kill. Corruption stats (one worker, 4,000 samples): SwingXtimes 12.6%, BinFill 15.1%, PickXtimes 16.3%, StopCube 15.8%, InsertPeg 27.0%, MoveCube 22.7%, RouteStick 24.8%, PickHighlight 21.3%, VideoRepick 19.4%, VideoPlaceOrder 16.9%, PatternLock 13.0% (46 samples), VideoPlaceButton 45.8% (59 samples; real-data check 24.2%), VideoUnmask 0.0% (9 protected), VideoUnmaskSwap 1.1%.
+**Route check** (`--variant general --step 5999 --swing-ahead --per-task VideoUnmask,SwingXtimes`; 71/0 fresh), mean (base@9999 → timingshift → general-v2@5999; timingshift swing_end from step 1999, per-task from step 6000):
+- swing_end caption +1 ahead: 72.6% → 27.2% → **13.5%**; swing_end caption → press: 55.9% → 15.9% → **11.9%**
+- mixed caption swap 38.6 → 27.9 → 26.5; mixed frame swap 6.3 → 13.8 → 11.7
+- VideoUnmask: caption swapped 81.4 → 44.2 → **50.6**; caption removed 38.7 → 20.6 → 15.1; frames swapped 9.9 → 22.5 → 36.1; frames removed 6.6 → 2.9 → 8.9
+- SwingXtimes: frames swapped 4.1 → 33.7 → **33.6**; caption swapped 46.7 → 9.9 → 19.3; frames removed 5.0 → 30.8 → 12.2; caption removed 26.8 → 21.5 → 19.5
+Gate (set in advance): VideoUnmask caption-swap ≥25% ✓ (50.6); SwingXtimes frames-swap > caption-swap ✓ (33.6 > 19.3). n=8/task, n=16 swing rows.
+**Upload:** HF `Nkoni/hybrid-groundsg-prompt-framesamp-modul-general-v2`: `5999.zip` 6,673,653,395 B, `history_config.txt` 593 B. **Smoke** (eval account): config matches; 71/0 fresh; caption change on synthetic scene 2.62%; QwenVL OK. **Eval:** `run_batch --target hybrid_general --tasks SwingXtimes,VideoUnmask --max-new-episodes 24`, `--detach`, `fc-01M4DCEMTPATRAW0XP7P3KVF2P`, app `ap-2TTXXhwJ64yTfp2BCwqEE7`. Compare: base SwingX 0/13, VideoUnmask 12/13; timingshift SwingX 4/11, VideoUnmask 10/11.
+
+### 2026-10-07 19:21-19:30 — Resume stopped by user and RELAUNCHED with fixed code (stable launch key + 48 GB host RAM); verified
+**Tags:** #hybrid #general #training
+User: "stop it now" → `modal app stop ap-43Fet5W7qA0WYKQLe5UmUl`; checkpoints still [2000]. Relaunched `run_training --variant general --num-train-steps 6000 --save-interval 2000 --resum-ckpt-id 2000`, `--detach`, `fc-01M4BJSH36E13TMV37P2XK68G5`, app `ap-P85xFaDh7GsdMn3WN6qqW8` (19:22). Log: `start decision ...: explicit resume from checkpoint 2000 (saved steps [2000]; owner None; me in-01M4BJSH3CF5HNSJW4VMZB81PV)` — launch key is now the suffix-free input id; `71 params from checkpoint, 0 fresh, 0 unused`; no memory kill; step 2,100 at 16:29 UTC. Expected effects of resuming (explained to user): optimizer moments reset + lr re-warmup; data order likely restarts with the same seed (≈8k samples repeated) — same as the timing-shift run's resume; small vs eval noise at n≈12.
+
+### 2026-10-07 ~19:20 — Resume run restarted once (host-RAM kill); auto-resume key was WRONG (my bug); both fixed for future launches
+**Tags:** #hybrid #infra #bug
+Resume app `ap-43Fet5W7qA0WYKQLe5UmUl` is training normally (start decision "explicit resume from checkpoint 2000"; step 2,020 at 1.1 it/s; corruption guard config loaded). Its log shows the FIRST attempt was killed: `Runner was terminated whilst exceeding its memory request` (host RAM, not GPU: ~12 GB checkpoint restore on host + 4 DataLoader workers; training functions had no memory request). Modal retried; the 2nd attempt runs.
+**Auto-resume flaw found from that log:** the two attempts had input ids `in-01M4BHYPES938HKZ117MCV7JZ6:1791389293039-0` and `in-01M4BHYPES938HKZ117MCV7JZ6:1791389459242-0` — Modal changes the suffix per retry, so comparing full input ids never matches; a preemption restart would NOT have auto-resumed (it would fall back to the launch's explicit --resum-ckpt-id; never deletes, but can redo progress). My unit tests had assumed a stable id.
+**Fixes (local; not in the running job's image):** launch key = input id without the retry suffix (verified identical across the two real attempts), call id only as fallback; owner file `<exp>.owner_launch_id`; `memory=49152` on run_tentative_remote/run_training_remote; new test using the two real ids. pytest 33/33.
+
+### 2026-10-07 18:55-19:08 — general-v2 run PREEMPTED by Modal at step ~2,730 (checkpoint 2000 safe); auto-resume added; resumed from 2000
+**Tags:** #hybrid #general #training #infra
+App `ap-qSqBITZPDrW2H8JmauQGWb` log: healthy to step 2,720 (losses ~0.002-0.004, 1.1 it/s, ckpt 2000 saved), then `Container terminated due to preemption. Your Function will be restarted with the same input.` The restart ran as a FRESH run (resum_ckpt_id=None) and the overwrite guard raised (`already has checkpoints [2000]; a fresh run would DELETE them`) → app stopped 18:57. Lost: steps 2000-2730 (~11 min A10G). Checkpoint 2000 intact.
+**Fix (user-approved):** new `training/run_guard.py::decide_start` + `_run` integration: the launch's Modal input id is stored next to the run dir (`<exp>.owner_input_id`); if the same input is restarted (preemption) and checkpoints exist → auto-resume from the LATEST checkpoint; explicit `--resum-ckpt-id` honoured; a different launch never deletes checkpoints unless --allow-overwrite. Tests `tests/test_run_guard.py` (incl. the 2026-10-07 case and "preempted resume continues from 4000 not 2000"); pytest 32/32.
+**Resumed:** `run_training --variant general --num-train-steps 6000 --save-interval 2000 --resum-ckpt-id 2000`, `--detach`, `fc-01M4BHYPE6MD7C792H7RXKJGSD`, app `ap-43Fet5W7qA0WYKQLe5UmUl` (includes auto-resume + loud corruption guard). Note: resume resets optimizer moments + 500-step lr re-warmup (released resume semantics).
+
+### 2026-10-07 ~18:06 — general-v2 tentative PASS; 6,000-step retrain LAUNCHED; loud corruption-rate guard added for future runs
+**Tags:** #hybrid #general #training #fix
+Tentative (app `ap-AeBbT7KkNBaHIi0RfY5wd1`, exp `...-general-v2-tentative`, warm start timingshift/6000): corruption config loaded; 71 / 0 fresh / 0 unused; Step 0 loss=0.0021, grad_norm=0.0517; completed 18:06. Retrain auto-launched: `run_training --variant general --num-train-steps 6000 --save-interval 2000`, `--detach`, `fc-01M4BEE1RDHBQ0C84JHGJ6JEXM`, app `ap-qSqBITZPDrW2H8JmauQGWb`.
+**Guard (local code, AFTER the retrain launched, so it is not in that run's image):** `CorruptionStats.check()` runs once at 2,000 samples per DataLoader worker and raises if any task with >=150 samples is >35% corrupted or has <5% window hits (corrupted + protected). Tests: guard passes on intended rates, raises on the 2026-10-07 PatternLock-90% pattern and on 0% (augmentation silently off); pytest 27/27. Standing rule saved to memory (feedback_verify_data_changes_on_real_data) and pre-flight checklist.
+
+### 2026-10-07 — Coverage bug FIXED and verified on the real data; retrain as "general-v2"
+**Tags:** #hybrid #general #fix
+`build_windows` fix: (1) a window longer than the remaining target is placed only with probability remaining/length and placement stops → expected coverage = target at any episode length; (2) an out-of-range held shift picks a valid shift, else becomes a dropout window (skipping it had under-covered 1-3-subgoal tasks). New unit test: expected coverage within ±0.02 of 0.20 for 2000/420/150/80-step episodes; pytest 26/26.
+New `diagnostics/check_corruption_coverage.py` (CPU, all 1,307 real timelines, step-weighted = what training samples). After fix (1) only: 6.7-16.1%. After (1)+(2): BinFill 16.4%, ButtonUnmask 0.0%, ButtonUnmaskSwap 8.9% (12.1% protected), InsertPeg 22.9%, MoveCube 17.2%, PatternLock 15.5%, PickHighlight 17.7%, PickXtimes 14.4%, RouteStick 22.9%, StopCube 19.2%, SwingXtimes 16.3%, VideoPlaceButton 24.2%, VideoPlaceOrder 17.4%, VideoRepick 20.3%, VideoUnmask 1.2% (17.8% protected), VideoUnmaskSwap 1.4% (14.3% protected). (First run: 4-91%.)
+Renamed to exp `...-general-v2` / HF `...-general-v2` / eval results `hybrid-general-v2-s5999-...`; v1 dir `...-general` (over-corrupted, ckpts 2000/4000/5999) kept, not deleted.
+
+### 2026-10-07 17:20 — "general" 6,000-step run COMPLETE, but its corruption rate was WRONG (my bug): 36-91% of steps on most tasks instead of ~20%
+**Tags:** #hybrid #general #training #bug
+App `ap-Tesbe1cZKv0MHWZYkanMZa` stopped 17:20 on its own; saved [2000, 4000, 5999]; final single-batch losses steps 5920-5980: 0.0047/0.0056/0.0043/0.0034; no errors.
+**Bug found in its own stats (one DataLoader worker, 6,000 samples), corrupted share per task:** VideoUnmask 4.4% (68/90 protected), VideoUnmaskSwap 8.1%, ButtonUnmask 16.7%, ButtonUnmaskSwap 21.8%, BinFill 35.8%, PickXtimes 39.4%, SwingXtimes 42.3%, PickHighlight 46.9%, VideoRepick 48.6%, StopCube 51.5%, InsertPeg 69.3%, RouteStick 73.4%, VideoPlaceButton 71.2%, VideoPlaceOrder 77.0%, MoveCube 81.7%, PatternLock 91.0% (mostly dropout). Cause: `build_windows` uses absolute 50-300-step windows regardless of episode length, so one window covers 1/3 to all of a short episode; the unit test only used a 2,000-step episode. So this checkpoint is NOT the agreed "~20% for every task" method. Proposed fix: accept each window with probability min(1, remaining_target/length) so expected coverage is 20% at any episode length, plus a short-episode unit test; retrain (~$2). Awaiting user choice: fix+retrain vs evaluate this checkpoint anyway.
+
+### 2026-10-07 — PER-TASK route check (which memory each task follows): original hybrid follows the CAPTION on both tasks; timing-shift@6000 flips SwingXtimes to the FRAMES while VideoUnmask stays caption-driven
+**Tags:** #hybrid #diagnostic #per-task
+New `check_routes --per-task VideoUnmask,SwingXtimes` (8 real samples per task, same draws for both checkpoints: VideoUnmask after 915 draws, SwingXtimes after 82; fixed noise). Relative action change, mean (max):
+
+| row | base@9999 | timingshift@6000 |
+|---|---|---|
+| VideoUnmask: caption removed | 38.7% (134.9) | 20.6% (87.6) |
+| VideoUnmask: frames removed | 6.6% (36.2) | 2.9% (12.2) |
+| VideoUnmask: caption swapped (same task) | **81.4%** (141.3) | **44.2%** (132.5) |
+| VideoUnmask: frames swapped (same task) | 9.9% (38.7) | 22.5% (73.1) |
+| SwingXtimes: caption removed | 26.8% (111.5) | 21.5% (109.8) |
+| SwingXtimes: frames removed | 5.0% (15.0) | **30.8%** (173.8) |
+| SwingXtimes: caption swapped (same task) | **46.7%** (135.1) | 9.9% (43.4) |
+| SwingXtimes: frames swapped (same task) | 4.1% (10.2) | **33.7%** (189.2) |
+| (mixed batch) caption swap / frame swap | 38.6% / 6.3% | 27.9% / 13.8% |
+
+**Reading:** the original hybrid followed the caption on BOTH tasks (SwingXtimes frames ~4-5% — the frame route was effectively unused there, explaining 0/13). After timing-shift, SwingXtimes is frame-driven (frames removed/swapped 31-34% vs caption swapped 10%) while VideoUnmask remains caption-driven (caption swapped 44% vs frames removed 3%) — the per-task specialisation the hybrid was meant to have, learned from data. VideoUnmask's caption influence halved (81→44%) yet its eval held (10/11); its frames-swapped rose 10→23% (swapping in another episode's demo video plausibly matters there). n=8 per task — magnitudes rough.
+
+### 2026-10-07 ~15:35-15:45 — "general" tentative PASS; 6,000-step fine-tune LAUNCHED (from timing-shift@6000)
+**Tags:** #hybrid #general #training
+Tentative `run_tentative_detached --variant general` (app `ap-eY54IGJSj0GsH5nGqqQdg3`, `fc-01M4B5TV6EDKFX4T3E9NDD1SXX`, A10G, batch 4, exp `...-general-tentative`): warm start `.../...-timingshift/6000/params`; `[caption_aug] loaded 1307 timelines; shift config None; corruption config CorruptionConfig(coverage=0.2, min_len=50, max_len=300, p_held_shift=0.5, p_dropout=0.5, max_shift=3, seed=0)`; merge 71 / 0 fresh / 0 unused; **Step 0: grad_norm=0.1156, llm_grad_norm=0.0663, loss=0.0092, mem_enc_norm=0.0033, param_norm=1871.24**; "Tentative run completed", stopped 15:43. (Step-0 loss 0.0092 < timing-shift's 0.0439 at its start: the warm start already handles shifted captions; dropout/held windows are new.)
+Training auto-launched by the chain: `run_training --variant general --num-train-steps 6000 --save-interval 2000 --batch-size 4`, `--detach`, `fc-01M4B68491ZTYGC5HJCZB75S7Q`, app `ap-Tesbe1cZKv0MHWZYkanMZa` (`ephemeral (detached)`). Checkpoints expected 2000/4000/5999. In parallel (separate containers): per-task route checks on base@9999 and timingshift@6000.
+
+### 2026-10-07 — "general" variant warm start changed to timing-shift step 6000 (user decision)
+**Tags:** #hybrid #general
+User: the goal is improvement, so build on the improved timing-shift@6000 rather than the original hybrid@9999. Consequence noted: gains cannot be attributed to the general rule alone (mixes timing-shift rules + general rule + extra steps). Extra caution: caption influence is already lower at 6000 (caption swap 28.3% vs 38.6% originally) → route-check gate caption swap >= 25% and VideoUnmask within error of 12/13.
+
+### 2026-10-07 — "General" caption corruption (task-agnostic) BUILT: local code + tests, $0
+**Tags:** #hybrid #general #idea
+**Why:** user asked for a general method instead of designing training rules from one task's failure logs, with caption-heavy tasks kept unaffected. **Rule (same for every task):** ~20% of each episode's execution steps fall in 50-300-step windows; each window either HOLDS a caption 1-3 subgoals earlier/later (real caption of the same episode, fixed for the whole window while the robot progresses — how QwenVL's errors behave) or shows NO caption; actions always true. No task groups, no "press" special case, no content corruption (deliberately excluded: it would teach distrust of correctly-timed captions that name the target, the risk for caption-heavy tasks); target-naming captions never altered. Windows deterministic per (seed, episode).
+**Files:** new `training/caption_corruption.py`; `training/hybrid_dataset.py` (caption_corruption OFF by default; mutually exclusive with caption_shift); new `config/hybrid-groundsg-prompt-framesamp-modul-general.yaml`; launcher variant `general` (exp `...-general`, warm start ORIGINAL hybrid base/9999 so the result reflects this method alone, HF repo `...-general`); eval target `hybrid_general` (GEN_STEP 5999); new `tests/test_caption_corruption.py`. Local: pytest 23/23 pass (6 new); ruff clean.
+**Agreed eval scope (user):** SwingXtimes + VideoUnmask only first; widen to more tasks only if both look good. Pass rule set in advance: VideoUnmask within error of the old hybrid (12/13); SwingXtimes improves over 0/13 (timing-shift reached 4/11).
+
 ### 2026-10-06 ~15:50 — Timing-shift@6000 VideoUnmask check STOPPED by user at 11 episodes: 10/11 (old hybrid 12/13) — VideoUnmask NOT hurt
 **Tags:** #hybrid #timingshift #eval
 `modal app stop ap-7XWh1uZqKvwCPTN4LAFI12` on user request; nothing running on either account. Seed 0, QwenVL captions, (episode, outcome, steps): 1 success 109, 2 success 123, 3 success 275, 4 success 110, 5 success 103, 6 success 96, **7 fail 111**, 8 success 127, 9 success 145, 10 success 119, 11 success 363 → **10/11 = 90.9%** (old hybrid 12/13 = 92.3%; released GroundSG+QwenVL 11/12 here; paper 88.67). The only failure, ep7, is QwenVL naming the wrong container (`<90-91, 78>` vs oracle `<92, 137>`) — the same episode and same QwenVL error that failed the old hybrid and the GroundSG control. Episode 0 was dispatched but never recorded (raised and was left pending; not investigated — logs had rotated).

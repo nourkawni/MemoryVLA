@@ -11,6 +11,8 @@ model):
   hybrid_timingshift  the timing-shift fine-tune of the hybrid (variant "timingshift", 2026-10-06),
                     published by `upload_checkpoint --variant timingshift`. Same model; built with the
                     timingshift yaml so the checkpoint's history_config.txt matches exactly.
+  hybrid_general    the general caption-corruption fine-tune (variant "general", 2026-10-07), from
+                    `upload_checkpoint --variant general`; built with the general yaml.
   control_groundsg  the paper's released GroundSG@79999 (Yinpei/mme_vla_suite), loaded through
                     the paper's own loader: mme_vla_suite.training.config.get_config(
                     "mme_vla_suite") + policies.policy_config.create_trained_policy -- the same
@@ -84,6 +86,10 @@ TS_HF_REPO = "Nkoni/hybrid-groundsg-prompt-framesamp-modul-timingshift"  # str, 
 TS_STEP = "6000"  # str, EDIT per evaluated timing-shift checkpoint -- also names its results volume
 TS_LOCAL_NAME = "hybrid-groundsg-prompt-framesamp-modul-timingshift"  # str, cache subdir on the ckpt volume
 
+GEN_HF_REPO = "Nkoni/hybrid-groundsg-prompt-framesamp-modul-general-v2"  # str, upload_checkpoint --variant general
+GEN_STEP = "5999"  # str, EDIT per evaluated general checkpoint -- also names its results volume
+GEN_LOCAL_NAME = "hybrid-groundsg-prompt-framesamp-modul-general-v2"  # str, cache subdir on the ckpt volume
+
 CONTROL_HF_REPO = "Yinpei/mme_vla_suite"  # str, the paper's released policies
 CONTROL_SUBDIR = "symbolic-grounded-subgoal"  # str
 CONTROL_STEP = "79999"  # str
@@ -116,12 +122,14 @@ qwen_volume = modal.Volume.from_name("hybrid-eval-qwen-cache", create_if_missing
 # volume as done, so a reused volume would report "0 new episodes" and evaluate nothing.
 results_volume_hybrid = modal.Volume.from_name(f"hybrid-s{HF_CKPT_STEP}-qwenvl-eval-results", create_if_missing=True)  # modal.Volume
 results_volume_ts = modal.Volume.from_name(f"hybrid-timingshift-s{TS_STEP}-qwenvl-eval-results", create_if_missing=True)  # modal.Volume
+results_volume_gen = modal.Volume.from_name(f"hybrid-general-v2-s{GEN_STEP}-qwenvl-eval-results", create_if_missing=True)  # modal.Volume
 results_volume_control = modal.Volume.from_name(f"hybrid-control-groundsg{CONTROL_STEP}-qwenvl-eval-results", create_if_missing=True)  # modal.Volume
 
 CKPT_VOLUME_PATH = "/ckpts"  # str
 QWEN_VOLUME_PATH = "/qwen_cache"  # str
 HYBRID_CKPT_DIR = f"{CKPT_VOLUME_PATH}/{HF_CKPT_LOCAL_NAME}/{HF_CKPT_STEP}"  # str
 TS_CKPT_DIR = f"{CKPT_VOLUME_PATH}/{TS_LOCAL_NAME}/{TS_STEP}"  # str
+GEN_CKPT_DIR = f"{CKPT_VOLUME_PATH}/{GEN_LOCAL_NAME}/{GEN_STEP}"  # str
 CONTROL_CKPT_DIR = f"{CKPT_VOLUME_PATH}/{CONTROL_SUBDIR}/{CONTROL_STEP}"  # str
 QWEN_ADAPTER_ROOT = f"{QWEN_VOLUME_PATH}/adapter"  # str
 QWEN_ADAPTER_PATH_FILE = f"{QWEN_VOLUME_PATH}/adapter_path.txt"  # str, written by download_qwen
@@ -135,6 +143,10 @@ TARGETS = {
     "hybrid_timingshift": {
         "results_path": "/results_hybrid_timingshift", "results_volume": results_volume_ts,
         "checkpoint_label": f"{TS_HF_REPO}/{TS_STEP}",
+    },
+    "hybrid_general": {
+        "results_path": "/results_hybrid_general", "results_volume": results_volume_gen,
+        "checkpoint_label": f"{GEN_HF_REPO}/{GEN_STEP}",
     },
     "control_groundsg": {
         "results_path": "/results_control_groundsg", "results_volume": results_volume_control,
@@ -307,6 +319,9 @@ def download_checkpoint(target: str) -> str:
     elif target == "hybrid_timingshift":
         repo_dir = pathlib.Path(CKPT_VOLUME_PATH) / TS_LOCAL_NAME  # pathlib.Path
         step, repo_id, prefix = TS_STEP, TS_HF_REPO, ""  # str, str, str
+    elif target == "hybrid_general":
+        repo_dir = pathlib.Path(CKPT_VOLUME_PATH) / GEN_LOCAL_NAME  # pathlib.Path
+        step, repo_id, prefix = GEN_STEP, GEN_HF_REPO, ""  # str, str, str
     else:
         repo_dir = pathlib.Path(CKPT_VOLUME_PATH) / CONTROL_SUBDIR  # pathlib.Path
         step, repo_id, prefix = CONTROL_STEP, CONTROL_HF_REPO, f"{CONTROL_SUBDIR}/"  # str, str, str
@@ -420,6 +435,12 @@ def _load_policy(seed: int, target: str):
         # timingshift yaml: same model, and the loader asserts the checkpoint's history_config.txt equals it
         train_config = _build_train_config(num_train_steps=10_000, batch_size=1, variant="timingshift")  # TrainConfig
         return create_hybrid_trained_policy(train_config, TS_CKPT_DIR, seed=seed)
+    if target == "hybrid_general":
+        from hybrid_prompt_modul.policies.hybrid_policy_config import create_hybrid_trained_policy
+        from hybrid_prompt_modul.training.launch_hybrid_training import _build_train_config
+
+        train_config = _build_train_config(num_train_steps=10_000, batch_size=1, variant="general")  # TrainConfig
+        return create_hybrid_trained_policy(train_config, GEN_CKPT_DIR, seed=seed)
 
     from mme_vla_suite.policies import policy_config as _policy_config
     from mme_vla_suite.training import config as _config
@@ -1035,7 +1056,8 @@ def dump_episodes(target: str, out_path: str = ""):
 
     _check_target(target)
     results = sorted(list_progress.remote(target)["results"], key=lambda r: (r["seed"], r["task_id"], r["episode_idx"]))  # list[dict]
-    default_name = {"hybrid": f"hybrid_s{HF_CKPT_STEP}", "hybrid_timingshift": f"hybrid_timingshift_s{TS_STEP}"}.get(target, target)  # str
+    default_name = {"hybrid": f"hybrid_s{HF_CKPT_STEP}", "hybrid_timingshift": f"hybrid_timingshift_s{TS_STEP}",
+                    "hybrid_general": f"hybrid_general_v2_s{GEN_STEP}"}.get(target, target)  # str
     out = pathlib.Path(out_path or f"hybrid_prompt_modul/eval/{default_name}_qwenvl_episodes.csv")  # pathlib.Path
     out.parent.mkdir(parents=True, exist_ok=True)
     cols = ["seed", "task_id", "episode_idx", "target", "success_flag", "steps", "timed_out", "num_caption_queries",

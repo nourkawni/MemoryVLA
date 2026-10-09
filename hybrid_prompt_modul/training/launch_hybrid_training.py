@@ -119,6 +119,16 @@ VARIANTS = {
         "warm_start_params": f"{CKPT_BASE_DIR}/{REPO_ID}/{EXP_NAME}/9999/params",
         "hf_repo": "Nkoni/hybrid-groundsg-prompt-framesamp-modul-timingshift",
     },
+    # "general" (2026-10-07): task-agnostic caption corruption (held timing shifts + caption dropout,
+    # same for every task; caption_corruption.py). Warm-started from the TIMING-SHIFT run's step 6000
+    # (user decision: the goal is the best model, so build on the improved checkpoint; consequence:
+    # gains cannot be attributed to the general rule alone).
+    "general": {
+        "exp_name": f"{EXP_NAME}-general-v2",  # v2: coverage fix 2026-10-07 (v1 dir "-general" kept, over-corrupted)
+        "history_config": "hybrid-groundsg-prompt-framesamp-modul-general.yaml",
+        "warm_start_params": f"{CKPT_BASE_DIR}/{REPO_ID}/{EXP_NAME}-timingshift/6000/params",
+        "hf_repo": "Nkoni/hybrid-groundsg-prompt-framesamp-modul-general-v2",
+    },
 }
 DEFAULT_VARIANT = "base"  # str
 
@@ -528,13 +538,28 @@ def _run(num_train_steps: int, batch_size: int, *, tentative_run: bool, resum_ck
     settings = _variant(variant)  # dict
     exp_name = settings["exp_name"] + ("-tentative" if tentative_run else "")  # str
     existing = _list_steps(exp_name)  # list[int]
-    if resum_ckpt_id is None and existing and not tentative_run and not allow_overwrite:
-        raise RuntimeError(
-            f"{exp_name} already has checkpoints {existing}; a fresh run would DELETE them. Resume with "
-            f"--resum-ckpt-id {existing[-1]}, or pass --allow-overwrite if deleting them is intended."
-        )
-    if resum_ckpt_id is not None and resum_ckpt_id not in existing:
-        raise RuntimeError(f"--resum-ckpt-id {resum_ckpt_id} not among saved steps {existing}")
+    if not tentative_run:
+        # Start-up decision (run_guard.py): auto-resume from the LATEST checkpoint when Modal restarts
+        # this same input after a preemption (2026-10-07: a preempted fresh run was restarted as a fresh
+        # run and only the overwrite guard saved checkpoint 2000); explicit resume; or refuse to delete.
+        from hybrid_prompt_modul.training.run_guard import decide_start
+
+        owner_file = pathlib.Path(CKPT_BASE_DIR) / REPO_ID / f"{exp_name}.owner_launch_id"  # pathlib.Path, NEXT TO the run dir
+        owner_id = owner_file.read_text().strip() if owner_file.exists() else None  # str | None
+        # Stable launch key = the input id WITHOUT its retry suffix. Verified from a real log 2026-10-07:
+        # the two attempts of one launch had input ids in-01M4BHYPES938HKZ117MCV7JZ6:1791389293039-0 and
+        # in-01M4BHYPES938HKZ117MCV7JZ6:1791389459242-0 -- same part before ":", new suffix per retry.
+        # The function-call id is only a fallback (its stability across retries was not observed).
+        input_id = modal.current_input_id()  # str | None
+        my_id = input_id.split(":")[0] if input_id else modal.current_function_call_id()  # str | None
+        resum_ckpt_id, reason = decide_start(existing, resum_ckpt_id, allow_overwrite, owner_id, my_id)  # int | None, str
+        print(f"[hybrid] start decision for {exp_name}: {reason} (saved steps {existing}; owner {owner_id}; me {my_id})")
+        if my_id is not None:
+            owner_file.parent.mkdir(parents=True, exist_ok=True)
+            owner_file.write_text(my_id)
+            training_volume.commit()
+        else:
+            print("[hybrid] WARNING: no Modal input id available -- automatic resume after preemption is disabled")
     if settings["warm_start_params"] is None:
         warm_inputs = (pathlib.Path(GROUNDSG_PARAMS), pathlib.Path(FRAMESAMP_MEMORY_NPZ))  # tuple[pathlib.Path, ...]
     else:
@@ -565,7 +590,9 @@ def _run(num_train_steps: int, batch_size: int, *, tentative_run: bool, resum_ck
 # ---------------------------------------------------------------------------------------------
 
 
-@app.function(image=image, gpu="A10G", timeout=1800, volumes=training_volumes)
+# memory=49152 (MB host RAM request): 2026-10-07 a resume was killed with "Runner was terminated
+# whilst exceeding its memory request" (checkpoint restore ~12 GB on host + 4 DataLoader workers).
+@app.function(image=image, gpu="A10G", timeout=1800, memory=49152, volumes=training_volumes)
 def run_tentative_remote(batch_size: int = DEFAULT_BATCH_SIZE, variant: str = DEFAULT_VARIANT) -> None:
     """
     What it does:
@@ -586,7 +613,7 @@ def run_tentative_remote(batch_size: int = DEFAULT_BATCH_SIZE, variant: str = DE
          save_interval=DEFAULT_SAVE_INTERVAL, allow_overwrite=True, variant=variant)
 
 
-@app.function(image=image, gpu="A10G", timeout=RUN_TRAINING_TIMEOUT_S, volumes=training_volumes)
+@app.function(image=image, gpu="A10G", timeout=RUN_TRAINING_TIMEOUT_S, memory=49152, volumes=training_volumes)
 def run_training_remote(num_train_steps: int = DEFAULT_NUM_TRAIN_STEPS, batch_size: int = DEFAULT_BATCH_SIZE,
                         resum_ckpt_id: int | None = None, save_interval: int = DEFAULT_SAVE_INTERVAL,
                         allow_overwrite: bool = False, variant: str = DEFAULT_VARIANT) -> None:
